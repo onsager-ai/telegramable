@@ -1,14 +1,14 @@
 # telegramable
 
+## Specs
+
+Specs live as GitHub issues labeled `spec` in [onsager-ai/telegramable](https://github.com/onsager-ai/telegramable/issues?q=label%3Aspec). No `specs/` folder, no spec files — the issue body is the spec; the comment thread is the audit trail; open/closed tracks lifecycle.
+
+Use the `issue-spec` skill (from `onsager-ai/dev-skills`) to draft new specs. Title format: `spec(<area>): <description>`. Labels: `spec` + type (`feat`/`fix`/`refactor`/`perf`) + `area:<X>` + `priority:<level>`. Sub-issues link parent/child decomposition.
+
 ## Skills
 
 This project uses the Agent Skills framework for domain-specific guidance.
-
-### leanspec-sdd - Spec-Driven Development
-
-- **Location**: `.github/skills/leanspec-sdd/SKILL.md`
-- **Use when**: Working with specs, planning features, multi-step changes
-- **Key principle**: Run `board` or `search` before creating specs
 
 ### development - Monorepo Conventions
 
