@@ -75,6 +75,40 @@ test("CliRuntime captures stdout from command", async () => {
   assert.ok(stdout.includes("hi"), "stdout should contain 'hi'");
 });
 
+// ---------- turn-complete event (#90) ----------
+
+test("CliRuntime emits turn-complete with userText and response after a successful turn", async () => {
+  const config: AgentConfig = { name: "echo-agent", command: TEST_CMD, args: ["echo-last-arg"] };
+  const runtime = new CliRuntime(config, logger);
+  const eventBus = new EventBus();
+  const events = collect(eventBus);
+
+  await runtime.execute(msg({ text: "remember me" }), "exec-turn-complete", eventBus);
+
+  const turnComplete = events.find((e) => e.type === "turn-complete");
+  assert.ok(turnComplete, "should emit turn-complete event");
+  assert.equal(turnComplete?.payload?.userText, "remember me", "turn-complete payload should include userText");
+  assert.equal(turnComplete?.payload?.response, "remember me", "turn-complete payload should include response");
+
+  // It must arrive after complete so subscribers see the final response.
+  const completeIdx = events.findIndex((e) => e.type === "complete");
+  const turnIdx = events.findIndex((e) => e.type === "turn-complete");
+  assert.ok(completeIdx >= 0 && turnIdx > completeIdx, "turn-complete should follow complete");
+});
+
+test("CliRuntime does not emit turn-complete on failed runs", async () => {
+  // The `fail` helper exits with code 1 so the `complete` handler enters the failure branch.
+  const config: AgentConfig = { name: "fail-agent", command: TEST_CMD, args: ["fail"] };
+  const runtime = new CliRuntime(config, logger);
+  const eventBus = new EventBus();
+  const events = collect(eventBus);
+
+  await runtime.execute(msg(), "exec-fail-turn", eventBus);
+
+  const turnComplete = events.find((e) => e.type === "turn-complete");
+  assert.equal(turnComplete, undefined, "should not emit turn-complete when the run failed");
+});
+
 // ---------- stderr ----------
 
 test("CliRuntime captures stderr", async () => {

@@ -3,7 +3,6 @@ import { AgentRegistry } from "../hub/agentRegistry";
 import { Logger } from "../logging";
 import { buildMemoryPrompt } from "../memory";
 import { MemoryProvider } from "../memory/provider";
-import { TelegramMemoryProvider } from "../memory/telegramProvider";
 import { CliRuntime } from "./cliRuntime";
 import { ClaudeSession } from "./session/claudeSession";
 import { CopilotSession } from "./session/copilotSession";
@@ -21,10 +20,10 @@ export interface CreateRuntimeOptions {
 export const createRuntime = (agent: AgentConfig, logger: Logger, options?: CreateRuntimeOptions): Runtime => {
   const { dataDir, memoryProvider } = options ?? {};
 
-  // Agent-driven memory via MCP stdio only works with TelegramMemoryProvider (file-based state)
-  const canUseAgentDrivenMemory = !!memoryProvider
-    && (!agent.runtime || agent.runtime === "cli")
-    && memoryProvider instanceof TelegramMemoryProvider;
+  // Agent-driven memory inside the main runtime has been retired (#90). Writes are
+  // now handled off the user-facing path by the async memory worker (#91); the main
+  // runtime only injects facts into the system prompt for reads.
+  const canUseAgentDrivenMemory = false;
 
   logger.info("Runtime memory config.", { agent: agent.name, runtime: agent.runtime || "cli", canUseAgentDrivenMemory, hasMemoryProvider: !!memoryProvider });
 

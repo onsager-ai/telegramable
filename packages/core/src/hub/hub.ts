@@ -10,6 +10,9 @@ import { formatMemoryList } from "../memory";
 import { MemoryProvider } from "../memory/provider";
 import { MemoryRefinementScheduler } from "../memory/scheduler";
 import { MemorySync } from "../memory/sync";
+import { IdleScheduler } from "../memory/worker/idleScheduler";
+import { MemoryWorkerQueue } from "../memory/worker/workerQueue";
+import { WorkerJobRunner } from "../memory/worker/types";
 import { FileSessionStore } from "../runtime/session/fileSessionStore";
 import { ChunkThrottler } from "./chunkThrottler";
 import { ExecutionRegistry, InMemoryExecutionRegistry } from "./executionRegistry";
@@ -230,6 +233,143 @@ const formatPermissionRequest = (toolName: string, toolInput: Record<string, unk
   );
 };
 
+// --- Tool activity rendering (#88) ----------------------------------
+
+type ToolCategory = "read" | "edit" | "bash" | "search" | "agent" | "thinking" | "other";
+
+const CATEGORY_EMOJI: Record<ToolCategory, string> = {
+  read: "📖",
+  edit: "✏️",
+  bash: "⚡",
+  search: "🔍",
+  agent: "🤖",
+  thinking: "💭",
+  other: "⚙️",
+};
+
+const CATEGORY_ORDER: ToolCategory[] = ["read", "edit", "bash", "search", "agent", "thinking", "other"];
+
+export const categorizeToolName = (toolName: string): ToolCategory => {
+  const lower = toolName.toLowerCase();
+  switch (lower) {
+    case "read":
+      return "read";
+    case "write":
+    case "edit":
+    case "multiedit":
+      return "edit";
+    case "bash":
+      return "bash";
+    case "grep":
+    case "glob":
+      return "search";
+    case "agent":
+    case "task":
+      return "agent";
+    case "thinking":
+      return "thinking";
+    default:
+      return "other";
+  }
+};
+
+const formatCategoryCounters = (tools: ReadonlyArray<{ name: string }>): string => {
+  const counts = new Map<ToolCategory, number>();
+  for (const t of tools) {
+    const cat = categorizeToolName(t.name);
+    counts.set(cat, (counts.get(cat) ?? 0) + 1);
+  }
+  const parts: string[] = [];
+  for (const cat of CATEGORY_ORDER) {
+    const n = counts.get(cat);
+    if (n) parts.push(`${CATEGORY_EMOJI[cat]}${n}`);
+  }
+  return parts.join(" ");
+};
+
+/** Max number of (deduplicated) entries shown inside the expandable blockquote. */
+const TOOL_ACTIVITY_BLOCKQUOTE_MAX = 150;
+
+interface RenderActivityState {
+  status: "running" | "complete" | "error";
+  tools: ReadonlyArray<{ name: string; input?: Record<string, unknown>; isSubagent?: boolean }>;
+  executionId: string;
+  durationMs?: number;
+  errorReason?: string;
+}
+
+/**
+ * Render a tool-activity status message for Telegram.
+ *
+ * Output:
+ *   {icon} {label}[ · N steps][ · {duration}]
+ *   {counters}[ · ▸ {current}]
+ *   [<i>{error reason}</i>]
+ *   <blockquote expandable>{full deduped step list}</blockquote>
+ *
+ * The blockquote is collapsed by default once its content exceeds ~3 lines.
+ * Contents are truncated at TOOL_ACTIVITY_BLOCKQUOTE_MAX deduped entries to
+ * stay safely under Telegram's 4096-char body cap.
+ */
+export const renderActivity = (state: RenderActivityState): string => {
+  const total = state.tools.length;
+
+  // Header line: icon + label + optional steps/duration
+  const icon = state.status === "complete" ? "✅" : state.status === "error" ? "❌" : "⚙️";
+  const label = state.status === "complete" ? "Done" : state.status === "error" ? "Error" : "Working";
+  const headerExtras: string[] = [];
+  if (total > 0) headerExtras.push(`${total} step${total === 1 ? "" : "s"}`);
+  if (state.durationMs != null && state.durationMs > 0) headerExtras.push(formatDuration(state.durationMs));
+  let header = `${icon} <b>${label}</b>`;
+  if (headerExtras.length > 0) header += ` · <i>${headerExtras.join(" · ")}</i>`;
+
+  const lines: string[] = [header];
+
+  // Counter line + (running only) ▸ current
+  if (total > 0) {
+    const counters = formatCategoryCounters(state.tools);
+    if (state.status === "running") {
+      const lastTool = state.tools[state.tools.length - 1];
+      const currentDesc = formatToolDescription(lastTool.name, lastTool.input);
+      lines.push(`${counters} · ▸ ${currentDesc}`);
+    } else {
+      lines.push(counters);
+    }
+  }
+
+  // Error reason between counters and blockquote
+  if (state.status === "error" && state.errorReason) {
+    lines.push(`<i>${escapeHtml(state.errorReason)}</i>`);
+  }
+
+  // Dedup-consecutive step list inside an expandable blockquote
+  if (total > 0) {
+    const deduped: Array<{ desc: string; count: number; isSubagent?: boolean }> = [];
+    for (const tool of state.tools) {
+      const desc = formatToolDescription(tool.name, tool.input);
+      const last = deduped[deduped.length - 1];
+      if (last && last.desc === desc && last.isSubagent === tool.isSubagent) {
+        last.count++;
+      } else {
+        deduped.push({ desc, count: 1, isSubagent: tool.isSubagent });
+      }
+    }
+
+    const visible = deduped.slice(0, TOOL_ACTIVITY_BLOCKQUOTE_MAX);
+    const blockquoteLines = visible.map((entry) => {
+      const prefix = entry.isSubagent ? "↳ " : "";
+      return entry.count > 1 ? `${prefix}${entry.desc} <i>x${entry.count}</i>` : `${prefix}${entry.desc}`;
+    });
+    if (deduped.length > TOOL_ACTIVITY_BLOCKQUOTE_MAX) {
+      const more = deduped.length - TOOL_ACTIVITY_BLOCKQUOTE_MAX;
+      blockquoteLines.push(`<i>… (${more} more, /logs ${state.executionId} for full)</i>`);
+    }
+    lines.push(`<blockquote expandable>${blockquoteLines.join("\n")}</blockquote>`);
+  }
+
+  return lines.join("\n");
+};
+
 export interface MemoryChannelInfo {
   /** The resolved numeric chat ID currently in use. */
   resolvedChatId: string;
@@ -251,7 +391,7 @@ export class ChannelHub {
   private readonly completionPending = new Set<string>(); // executionIds whose complete/error event is already queued — used to short-circuit pending stream-text sends
   private draftIdCounter = 0; // monotonic counter for Telegram draft IDs
   private readonly typingIntervals = new Map<string, ReturnType<typeof setInterval>>(); // periodic typing indicators
-  private readonly toolActivityMessages = new Map<string, { tools: Array<{ name: string; input?: Record<string, unknown>; isSubagent?: boolean }>; messageId?: number; promotionTimer?: ReturnType<typeof setTimeout>; promoted: boolean; sendingPromise?: Promise<void> }>(); // tool activity tracking
+  private readonly toolActivityMessages = new Map<string, { executionId: string; tools: Array<{ name: string; input?: Record<string, unknown>; isSubagent?: boolean }>; messageId?: number; promotionTimer?: ReturnType<typeof setTimeout>; promoted: boolean; sendingPromise?: Promise<void> }>(); // tool activity tracking
   private readonly eventQueues = new Map<string, Promise<void>>(); // serialize events per execution
   private readonly reactionMessageIds = new Map<string, number>(); // executionId → source messageId for clearing reactions
   private readonly downloadedFiles = new Map<string, string[]>(); // executionId → local file paths to clean up
@@ -268,7 +408,12 @@ export class ChannelHub {
     private readonly memoryChannelInfo?: MemoryChannelInfo,
     /** @deprecated Use memoryProvider instead. Kept for backward compat with MemorySync audit log. */
     private readonly memorySync?: MemorySync,
-    private readonly refinementScheduler?: MemoryRefinementScheduler
+    private readonly refinementScheduler?: MemoryRefinementScheduler,
+    private readonly memoryWorker?: {
+      scheduler: IdleScheduler;
+      queue: MemoryWorkerQueue;
+      runner: WorkerJobRunner;
+    },
   ) {
     this.executionRegistry = executionRegistry ?? new InMemoryExecutionRegistry();
     this.permissionBridge = new PermissionBridge(logger);
@@ -288,6 +433,13 @@ export class ChannelHub {
   async start(options?: IMAdapterStartOptions): Promise<void> {
     this.subscribeEvents();
     this.sudoWatcher?.start();
+
+    // Start the async memory worker if it was wired up.  It subscribes to the
+    // shared EventBus and dispatches per-channel jobs to its queue.
+    if (this.memoryWorker) {
+      this.memoryWorker.scheduler.start(this.eventBus, (job) => this.memoryWorker!.queue.enqueue(job));
+    }
+
     await Promise.all(Array.from(this.adapters.values()).map((adapter) => {
       return adapter.start((message) => void this.handleMessage({
         ...message,
@@ -306,6 +458,14 @@ export class ChannelHub {
 
     this.permissionBridge.cancelAll();
     this.sudoWatcher?.stop();
+
+    // Stop the memory worker first so it stops accepting new turn-complete
+    // events; kill any in-flight subprocess so the bot can exit cleanly.
+    if (this.memoryWorker) {
+      this.memoryWorker.scheduler.stop();
+      this.memoryWorker.queue.stop();
+      await this.memoryWorker.runner.shutdown();
+    }
 
     // Clear all typing indicator intervals
     for (const interval of this.typingIntervals.values()) {
@@ -1084,7 +1244,7 @@ export class ChannelHub {
 
     let activity = this.toolActivityMessages.get(activityKey);
     if (!activity) {
-      activity = { tools: [], promoted: false };
+      activity = { executionId: event.executionId, tools: [], promoted: false };
       this.toolActivityMessages.set(activityKey, activity);
     }
 
@@ -1120,32 +1280,15 @@ export class ChannelHub {
     // Otherwise: timer already running, tools are being accumulated — nothing to do yet
   }
 
-  /** Maximum number of recent tool steps to show in the activity timeline. */
-  private static readonly TOOL_ACTIVITY_MAX_VISIBLE = 5;
-
-  private async sendOrEditToolActivity(adapter: IMAdapter, chatId: string, activity: { tools: Array<{ name: string; input?: Record<string, unknown>; isSubagent?: boolean }>; messageId?: number; promoted: boolean }, topicId?: number): Promise<void> {
-    const total = activity.tools.length;
-    const maxVisible = ChannelHub.TOOL_ACTIVITY_MAX_VISIBLE;
-    // Show the last N tools as a timeline
-    const visible = activity.tools.slice(-maxVisible);
-    const lines: string[] = [];
-
-    for (let i = 0; i < visible.length; i++) {
-      const tool = visible[i];
-      const desc = formatToolDescription(tool.name, tool.input);
-      const isLast = i === visible.length - 1;
-      // Current (last) tool gets a spinner indicator, previous ones get a checkmark
-      const prefix = tool.isSubagent ? "↳ " : ""; // indent subagent steps
-      lines.push(isLast ? `${prefix}▸ ${desc}` : `${prefix}✓ ${desc}`);
-    }
-
-    const header = total > maxVisible
-      ? `⚙️ <b>Working</b> <i>(showing last ${maxVisible} of ${total} steps)</i>`
-      : total > 1
-        ? `⚙️ <b>Working</b> <i>(${total} steps)</i>`
-        : `⚙️ <b>Working</b>`;
-
-    const statusMsg = `${header}\n${lines.join("\n")}`;
+  private async sendOrEditToolActivity(adapter: IMAdapter, chatId: string, activity: { executionId: string; tools: Array<{ name: string; input?: Record<string, unknown>; isSubagent?: boolean }>; messageId?: number; promoted: boolean }, topicId?: number): Promise<void> {
+    const record = this.executionRegistry.get(activity.executionId);
+    const durationMs = record ? Date.now() - record.startedAt : undefined;
+    const statusMsg = renderActivity({
+      status: "running",
+      tools: activity.tools,
+      executionId: activity.executionId,
+      durationMs,
+    });
 
     if (activity.messageId && adapter.editMessage) {
       await adapter.editMessage(chatId, activity.messageId, statusMsg).catch(() => {
@@ -1179,33 +1322,19 @@ export class ChannelHub {
       await activity.sendingPromise;
     }
 
-    // If the message was sent to Telegram, edit it into a detailed completion summary
     if (activity.promoted && activity.messageId && adapter.editMessage && activity.tools.length > 0) {
-      const total = activity.tools.length;
-      // Deduplicate consecutive identical tools by their formatted description
-      const deduped: Array<{ desc: string; count: number; isSubagent?: boolean }> = [];
-      for (const tool of activity.tools) {
-        const desc = formatToolDescription(tool.name, tool.input);
-        const last = deduped[deduped.length - 1];
-        if (last && last.desc === desc && last.isSubagent === tool.isSubagent) {
-          last.count++;
-        } else {
-          deduped.push({ desc, count: 1, isSubagent: tool.isSubagent });
-        }
-      }
-      const maxVisible = ChannelHub.TOOL_ACTIVITY_MAX_VISIBLE;
-      const visible = deduped.slice(-maxVisible);
-      const lines: string[] = [];
-      for (const entry of visible) {
-        const prefix = entry.isSubagent ? "↳ " : "";
-        lines.push(entry.count > 1 ? `${prefix}✓ ${entry.desc} <i>x${entry.count}</i>` : `${prefix}✓ ${entry.desc}`);
-      }
-      const header = deduped.length > maxVisible
-        ? `✅ <b>Done</b> <i>(${total} steps, showing last ${maxVisible})</i>`
-        : total > 1
-          ? `✅ <b>Done</b> <i>(${total} steps)</i>`
-          : `✅ <b>Done</b>`;
-      const summary = `${header}\n${lines.join("\n")}`;
+      const record = this.executionRegistry.get(executionId);
+      const status: "complete" | "error" = record?.status === "error" ? "error" : "complete";
+      const durationMs = record?.startedAt
+        ? (record.finishedAt ?? Date.now()) - record.startedAt
+        : undefined;
+      const summary = renderActivity({
+        status,
+        tools: activity.tools,
+        executionId,
+        durationMs,
+        errorReason: record?.errorReason,
+      });
       await adapter.editMessage(chatId, activity.messageId, summary).catch(() => {});
     } else if (activity.promoted && activity.messageId && adapter.deleteMessage) {
       // If we can't edit (no tools recorded), just delete

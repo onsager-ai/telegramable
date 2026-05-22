@@ -5,7 +5,7 @@ import type { AddressInfo } from "net";
 import { existsSync, readFileSync } from "fs";
 import { EventBus } from "../src/events/eventBus";
 import { createLogger } from "../src/logging";
-import { ChannelHub, parseBuiltinCommand } from "../src/hub/hub";
+import { ChannelHub, categorizeToolName, parseBuiltinCommand, renderActivity } from "../src/hub/hub";
 import { Router } from "../src/hub/router";
 import { Runtime } from "../src/runtime/types";
 import { MockAdapter } from "./mockAdapter";
@@ -642,4 +642,127 @@ test("ChannelHub sends file-only message to runtime when no caption", async () =
   assert.ok(capturedText !== undefined, "runtime should have been called");
 
   await hub.stop();
+});
+
+// ---------- renderActivity / categorizeToolName (#88) ----------
+
+test("categorizeToolName maps tool names to categories case-insensitively", () => {
+  assert.equal(categorizeToolName("Read"), "read");
+  assert.equal(categorizeToolName("read"), "read");
+  assert.equal(categorizeToolName("Write"), "edit");
+  assert.equal(categorizeToolName("Edit"), "edit");
+  assert.equal(categorizeToolName("MultiEdit"), "edit");
+  assert.equal(categorizeToolName("Bash"), "bash");
+  assert.equal(categorizeToolName("Grep"), "search");
+  assert.equal(categorizeToolName("Glob"), "search");
+  assert.equal(categorizeToolName("Agent"), "agent");
+  assert.equal(categorizeToolName("Task"), "agent");
+  assert.equal(categorizeToolName("Thinking"), "thinking");
+  assert.equal(categorizeToolName("mcp__supabase__list_tables"), "other");
+  assert.equal(categorizeToolName("WebFetch"), "other");
+});
+
+test("renderActivity: empty tools produces header only", () => {
+  const out = renderActivity({ status: "running", tools: [], executionId: "x1" });
+  assert.ok(out.startsWith("⚙️ <b>Working</b>"), "should start with working header");
+  assert.ok(!out.includes("blockquote"), "no blockquote when no tools");
+  assert.ok(!out.includes("·"), "no extras (steps/duration) when empty and no duration");
+});
+
+test("renderActivity: single running tool shows step count, current cue, and blockquote", () => {
+  const out = renderActivity({
+    status: "running",
+    tools: [{ name: "Read", input: { file_path: "/tmp/a.ts" } }],
+    executionId: "x2",
+  });
+  assert.ok(out.includes("⚙️ <b>Working</b>"), "running header");
+  assert.ok(out.includes("1 step"), "1 step in header");
+  assert.ok(out.includes("📖1"), "counter line with read=1");
+  assert.ok(out.includes("· ▸"), "current tool cue while running");
+  assert.ok(out.includes("<blockquote expandable>"), "blockquote present");
+  assert.ok(out.includes("Reading"), "step rendered inside blockquote");
+});
+
+test("renderActivity: single done tool drops current cue and shows duration", () => {
+  const out = renderActivity({
+    status: "complete",
+    tools: [{ name: "Read", input: { file_path: "/a.ts" } }],
+    executionId: "x3",
+    durationMs: 8_000,
+  });
+  assert.ok(out.includes("✅ <b>Done</b>"), "done header");
+  assert.ok(out.includes("1 step"), "step count");
+  assert.ok(out.includes("8s"), "duration in header");
+  assert.ok(!out.includes("▸"), "no current cue when done");
+});
+
+test("renderActivity: many running tools include each category in counter line", () => {
+  const out = renderActivity({
+    status: "running",
+    tools: [
+      { name: "Read", input: { file_path: "/a" } },
+      { name: "Read", input: { file_path: "/b" } },
+      { name: "Read", input: { file_path: "/c" } },
+      { name: "Edit", input: { file_path: "/a" } },
+      { name: "Edit", input: { file_path: "/b" } },
+      { name: "Bash", input: { command: "ls" } },
+      { name: "Grep", input: { pattern: "foo" } },
+    ],
+    executionId: "x4",
+  });
+  assert.ok(out.includes("📖3"), "read=3");
+  assert.ok(out.includes("✏️2"), "edit=2");
+  assert.ok(out.includes("⚡1"), "bash=1");
+  assert.ok(out.includes("🔍1"), "search=1");
+  assert.ok(out.includes("7 steps"), "total in header");
+});
+
+test("renderActivity: many done tools dedup consecutive identical entries with xN", () => {
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Read", input: { file_path: "/a.ts" } },
+      { name: "Read", input: { file_path: "/a.ts" } },
+      { name: "Read", input: { file_path: "/a.ts" } },
+      { name: "Bash", input: { command: "ls" } },
+    ],
+    executionId: "x5",
+    durationMs: 12_000,
+  });
+  assert.ok(out.includes("x3"), "consecutive identical entries collapsed with count");
+  assert.ok(out.includes("4 steps"), "step header reflects raw count, not deduped count");
+});
+
+test("renderActivity: error with reason renders icon, reason between counters and blockquote", () => {
+  const out = renderActivity({
+    status: "error",
+    tools: [{ name: "Bash", input: { command: "rm -rf /" } }],
+    executionId: "x6",
+    errorReason: "Runtime timeout.",
+    durationMs: 600_000,
+  });
+  assert.ok(out.includes("❌ <b>Error</b>"), "error header");
+  assert.ok(out.includes("Runtime timeout."), "reason included");
+  const reasonIdx = out.indexOf("Runtime timeout.");
+  const counterIdx = out.indexOf("⚡1");
+  const blockquoteIdx = out.indexOf("<blockquote");
+  assert.ok(counterIdx > 0 && reasonIdx > counterIdx, "reason after counter line");
+  assert.ok(reasonIdx < blockquoteIdx, "reason before blockquote");
+});
+
+test("renderActivity: 200-step run truncates blockquote contents with /logs hint", () => {
+  // Each step has unique input so dedup doesn't collapse them.  The 150-entry
+  // threshold was chosen for simplicity (over a dynamic byte-budget); for
+  // typical reads/edits/searches that stays well under Telegram's 4096-char
+  // cap.  Adversarial inputs with very long descriptions can still exceed it
+  // — Telegram rejects the edit in that case and the previous "Working"
+  // status remains visible, which is an acceptable graceful failure mode.
+  const tools = Array.from({ length: 200 }, (_, i) => ({
+    name: "Read",
+    input: { file_path: `/f${i}.ts` },
+  }));
+  const out = renderActivity({ status: "running", tools, executionId: "exec-200" });
+  assert.ok(out.includes("200 steps"), "step header shows total");
+  assert.ok(out.includes("📖200"), "counter reflects raw total, not truncated");
+  assert.ok(out.includes("(50 more, /logs exec-200 for full)"), "truncation hint with executionId");
 });
