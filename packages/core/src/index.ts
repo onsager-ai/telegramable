@@ -16,6 +16,7 @@ import { MemorySync } from "./memory/sync";
 import { TelegramMemoryProvider } from "./memory/telegramProvider";
 import { IdleScheduler } from "./memory/worker/idleScheduler";
 import { MemoryWorker } from "./memory/worker/memoryWorker";
+import { PendingTurnsStore } from "./memory/worker/persistence";
 import { MemoryWorkerQueue } from "./memory/worker/workerQueue";
 import { createAgentRegistry } from "./runtime";
 import { FileSessionStore } from "./runtime/session/fileSessionStore";
@@ -162,23 +163,29 @@ export async function startDaemon(): Promise<void> {
   const adapters = config.channels.map((channel) => createAdapter(channel, logger));
   const router = new DefaultRouter(config.channels, registry);
 
-  // Async memory worker (#91) — only when we have a Telegram memory provider,
+  // Async memory worker (#91/#92) — only when we have a Telegram memory provider,
   // since the worker drives the MCP-backed flow that mutates pinned-message
   // memory state.  Other providers (mem0) don't yet have a worker.
   let memoryWorkerWiring: { scheduler: IdleScheduler; queue: MemoryWorkerQueue; runner: MemoryWorker } | undefined;
   if (memoryProvider instanceof TelegramMemoryProvider) {
     const claudeAgent = config.agents.find((a) => !a.runtime || a.runtime === "cli");
     const claudeCommand = process.env.MEMORY_WORKER_CMD || claudeAgent?.command || "claude";
+    const persistence = config.dataDir
+      ? new PendingTurnsStore(`${config.dataDir}/memory-snapshots`, logger)
+      : undefined;
+    if (!persistence) {
+      logger.warn("No DATA_DIR configured — memory worker pendingTurns will not survive process restarts.");
+    }
     const runner = new MemoryWorker({
       provider: memoryProvider,
       claudeCommand,
       logger,
       dataDir: config.dataDir,
     });
-    const scheduler = new IdleScheduler({ logger });
-    const queue = new MemoryWorkerQueue(runner, scheduler, { logger });
+    const scheduler = new IdleScheduler({ logger, persistence });
+    const queue = new MemoryWorkerQueue(runner, scheduler, { logger, persistence });
     memoryWorkerWiring = { scheduler, queue, runner };
-    logger.info("Memory worker wired.", { claudeCommand });
+    logger.info("Memory worker wired.", { claudeCommand, persistence: !!persistence });
   }
 
   const hub = new ChannelHub(

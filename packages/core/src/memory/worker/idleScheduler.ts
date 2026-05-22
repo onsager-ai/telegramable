@@ -1,5 +1,6 @@
 import { EventBus } from "../../events/eventBus";
 import { Logger } from "../../logging";
+import { PendingTurnsStore } from "./persistence";
 import { TurnRecord, WorkerJob } from "./types";
 
 export interface ChannelState {
@@ -18,6 +19,8 @@ export interface IdleSchedulerOptions {
   /** Override `Date.now` — used in tests with fake clocks. */
   now?: () => number;
   logger?: Logger;
+  /** Optional disk persistence so pendingTurns survives process restarts. */
+  persistence?: PendingTurnsStore;
 }
 
 const DEFAULT_IDLE_THRESHOLD_MS = 300_000;
@@ -48,6 +51,7 @@ export class IdleScheduler {
   private readonly tickIntervalMs: number;
   private readonly now: () => number;
   private readonly logger?: Logger;
+  private readonly persistence?: PendingTurnsStore;
   private tickTimer?: ReturnType<typeof setInterval>;
   private unsubscribe?: () => void;
   private onDispatch?: (job: WorkerJob) => void;
@@ -57,10 +61,35 @@ export class IdleScheduler {
     this.tickIntervalMs = options.tickIntervalMs ?? envInt("MEMORY_WORKER_TICK_MS") ?? DEFAULT_TICK_INTERVAL_MS;
     this.now = options.now ?? Date.now;
     this.logger = options.logger;
+    this.persistence = options.persistence;
   }
 
   start(eventBus: EventBus, dispatch: (job: WorkerJob) => void): void {
     if (this.unsubscribe) return; // idempotent
+
+    // Recover pendingTurns from disk so a process restart between turn-complete
+    // and worker dispatch doesn't silently drop the batch.
+    if (this.persistence) {
+      const recovered = this.persistence.loadAll();
+      for (const { channelId, chatId, turns } of recovered) {
+        if (turns.length === 0) continue;
+        const key = this.channelKey(channelId, chatId);
+        const lastTurnAt = turns.reduce((max, t) => (t.timestamp > max ? t.timestamp : max), 0);
+        this.channels.set(key, {
+          channelId,
+          chatId,
+          lastTurnAt,
+          lastWorkerRunAt: 0,
+          pendingTurns: turns,
+        });
+      }
+      if (recovered.length > 0) {
+        this.logger?.info("Memory IdleScheduler recovered persisted pendingTurns.", {
+          channels: recovered.length,
+          totalTurns: recovered.reduce((s, r) => s + r.turns.length, 0),
+        });
+      }
+    }
 
     this.onDispatch = dispatch;
     this.unsubscribe = eventBus.on((event) => {
@@ -110,6 +139,7 @@ export class IdleScheduler {
     }
     state.pendingTurns.push(turn);
     if (turn.timestamp > state.lastTurnAt) state.lastTurnAt = turn.timestamp;
+    this.persist(state);
   }
 
   /** Force a scheduling check.  Public so tests can drive deterministically. */
@@ -145,6 +175,7 @@ export class IdleScheduler {
     // Only drop turns that were part of the dispatched batch.  New turns that
     // arrived after dispatchedAt must survive for the next idle cycle.
     state.pendingTurns = state.pendingTurns.filter((t) => t.timestamp > dispatchedAt);
+    this.persist(state);
   }
 
   /** Called by the worker queue when a job fails — undoes the lastWorkerRunAt bump. */
@@ -154,6 +185,19 @@ export class IdleScheduler {
     // Only reset if no newer dispatch has happened.
     if (state.lastWorkerRunAt === dispatchedAt) {
       state.lastWorkerRunAt = 0;
+    }
+  }
+
+  private persist(state: ChannelState): void {
+    if (!this.persistence) return;
+    try {
+      this.persistence.save(state.channelId, state.chatId, state.pendingTurns);
+    } catch (err) {
+      this.logger?.warn("PendingTurnsStore: failed to persist pendingTurns.", {
+        channelId: state.channelId,
+        chatId: state.chatId,
+        reason: err instanceof Error ? err.message : "unknown",
+      });
     }
   }
 

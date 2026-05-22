@@ -463,6 +463,7 @@ export class ChannelHub {
     // events; kill any in-flight subprocess so the bot can exit cleanly.
     if (this.memoryWorker) {
       this.memoryWorker.scheduler.stop();
+      this.memoryWorker.queue.stop();
       await this.memoryWorker.runner.shutdown();
     }
 
