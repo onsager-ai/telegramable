@@ -28,7 +28,6 @@ telegramable/
 ├── packages/       # Shared libraries
 │   └── ui/         # @telegramable/ui - UI components
 ├── src/            # Root package source (core runtime)
-├── specs/          # LeanSpec specifications
 └── tests/          # E2E and integration tests
 ```
 
