@@ -9,7 +9,8 @@ export type ExecutionEventType =
   | "permission-response"
   | "stream-text"
   | "tool-use"
-  | "thinking";
+  | "thinking"
+  | "turn-complete";
 
 export interface ExecutionEvent {
   executionId: string;
@@ -39,5 +40,8 @@ export interface ExecutionEvent {
 
     // Source message metadata (e.g. for reactions)
     messageId?: number;
+
+    // turn-complete fields: user's original prompt for memory worker snapshots
+    userText?: string;
   };
 }

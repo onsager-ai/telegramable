@@ -622,13 +622,23 @@ export class CliRuntime implements Runtime {
           payload: { code: code ?? null, response: response || undefined }
         });
 
-        // Sync memories from the MCP state file (agent-driven), or fall back to post-hoc extraction
+        // Clean up MCP files if they were prepared (paused but kept for the
+        // async memory worker — #91 reuses this wire-up inside a subprocess).
         if (mcpFiles) {
-          void this.syncMemoryFromFile(mcpFiles.stateFilePath, mcpFiles.baseline).finally(() => {
-            this.cleanupMcpFiles(mcpFiles.mcpDir, mcpFiles.mcpConfigPath, mcpFiles.stateFilePath);
+          this.cleanupMcpFiles(mcpFiles.mcpDir, mcpFiles.mcpConfigPath, mcpFiles.stateFilePath);
+        }
+
+        // Memory writes have moved off the user-facing path. The async memory worker
+        // (#91) subscribes to `turn-complete` and dispatches a subprocess on idle.
+        if (code === 0 && response) {
+          eventBus.emit({
+            executionId,
+            channelId: message.channelId,
+            chatId: message.chatId,
+            type: "turn-complete",
+            timestamp: Date.now(),
+            payload: { userText: message.text, response }
           });
-        } else if (response && this.memoryProvider) {
-          void this.extractMemory(message.text, response);
         }
 
         resolve();
