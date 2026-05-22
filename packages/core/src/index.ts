@@ -14,6 +14,9 @@ import { MemoryRefiner } from "./memory/refiner";
 import { MemoryRefinementScheduler } from "./memory/scheduler";
 import { MemorySync } from "./memory/sync";
 import { TelegramMemoryProvider } from "./memory/telegramProvider";
+import { IdleScheduler } from "./memory/worker/idleScheduler";
+import { MemoryWorker } from "./memory/worker/memoryWorker";
+import { MemoryWorkerQueue } from "./memory/worker/workerQueue";
 import { createAgentRegistry } from "./runtime";
 import { FileSessionStore } from "./runtime/session/fileSessionStore";
 
@@ -158,7 +161,38 @@ export async function startDaemon(): Promise<void> {
 
   const adapters = config.channels.map((channel) => createAdapter(channel, logger));
   const router = new DefaultRouter(config.channels, registry);
-  const hub = new ChannelHub(adapters, router, eventBus, logger, undefined, memoryProvider, memoryChannelInfo, memorySync, refinementScheduler);
+
+  // Async memory worker (#91) — only when we have a Telegram memory provider,
+  // since the worker drives the MCP-backed flow that mutates pinned-message
+  // memory state.  Other providers (mem0) don't yet have a worker.
+  let memoryWorkerWiring: { scheduler: IdleScheduler; queue: MemoryWorkerQueue; runner: MemoryWorker } | undefined;
+  if (memoryProvider instanceof TelegramMemoryProvider) {
+    const claudeAgent = config.agents.find((a) => !a.runtime || a.runtime === "cli");
+    const claudeCommand = process.env.MEMORY_WORKER_CMD || claudeAgent?.command || "claude";
+    const runner = new MemoryWorker({
+      provider: memoryProvider,
+      claudeCommand,
+      logger,
+      dataDir: config.dataDir,
+    });
+    const scheduler = new IdleScheduler({ logger });
+    const queue = new MemoryWorkerQueue(runner, scheduler, { logger });
+    memoryWorkerWiring = { scheduler, queue, runner };
+    logger.info("Memory worker wired.", { claudeCommand });
+  }
+
+  const hub = new ChannelHub(
+    adapters,
+    router,
+    eventBus,
+    logger,
+    undefined,
+    memoryProvider,
+    memoryChannelInfo,
+    memorySync,
+    refinementScheduler,
+    memoryWorkerWiring,
+  );
 
   await hub.start();
 

@@ -10,6 +10,9 @@ import { formatMemoryList } from "../memory";
 import { MemoryProvider } from "../memory/provider";
 import { MemoryRefinementScheduler } from "../memory/scheduler";
 import { MemorySync } from "../memory/sync";
+import { IdleScheduler } from "../memory/worker/idleScheduler";
+import { MemoryWorkerQueue } from "../memory/worker/workerQueue";
+import { WorkerJobRunner } from "../memory/worker/types";
 import { FileSessionStore } from "../runtime/session/fileSessionStore";
 import { ChunkThrottler } from "./chunkThrottler";
 import { ExecutionRegistry, InMemoryExecutionRegistry } from "./executionRegistry";
@@ -405,7 +408,12 @@ export class ChannelHub {
     private readonly memoryChannelInfo?: MemoryChannelInfo,
     /** @deprecated Use memoryProvider instead. Kept for backward compat with MemorySync audit log. */
     private readonly memorySync?: MemorySync,
-    private readonly refinementScheduler?: MemoryRefinementScheduler
+    private readonly refinementScheduler?: MemoryRefinementScheduler,
+    private readonly memoryWorker?: {
+      scheduler: IdleScheduler;
+      queue: MemoryWorkerQueue;
+      runner: WorkerJobRunner;
+    },
   ) {
     this.executionRegistry = executionRegistry ?? new InMemoryExecutionRegistry();
     this.permissionBridge = new PermissionBridge(logger);
@@ -425,6 +433,13 @@ export class ChannelHub {
   async start(options?: IMAdapterStartOptions): Promise<void> {
     this.subscribeEvents();
     this.sudoWatcher?.start();
+
+    // Start the async memory worker if it was wired up.  It subscribes to the
+    // shared EventBus and dispatches per-channel jobs to its queue.
+    if (this.memoryWorker) {
+      this.memoryWorker.scheduler.start(this.eventBus, (job) => this.memoryWorker!.queue.enqueue(job));
+    }
+
     await Promise.all(Array.from(this.adapters.values()).map((adapter) => {
       return adapter.start((message) => void this.handleMessage({
         ...message,
@@ -443,6 +458,13 @@ export class ChannelHub {
 
     this.permissionBridge.cancelAll();
     this.sudoWatcher?.stop();
+
+    // Stop the memory worker first so it stops accepting new turn-complete
+    // events; kill any in-flight subprocess so the bot can exit cleanly.
+    if (this.memoryWorker) {
+      this.memoryWorker.scheduler.stop();
+      await this.memoryWorker.runner.shutdown();
+    }
 
     // Clear all typing indicator intervals
     for (const interval of this.typingIntervals.values()) {
