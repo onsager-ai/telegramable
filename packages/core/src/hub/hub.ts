@@ -601,6 +601,9 @@ export class ChannelHub {
     this.logger.info("ChannelHub started.", { channels: Array.from(this.adapters.keys()) });
   }
 
+  /** Hard upper bound on best-effort Telegram cleanup during shutdown. */
+  private static readonly SHUTDOWN_GRACE_MS = 5_000;
+
   async stop(): Promise<void> {
     if (this.unsubscribeEvents) {
       this.unsubscribeEvents();
@@ -618,11 +621,19 @@ export class ChannelHub {
       await this.memoryWorker.runner.shutdown();
     }
 
-    // Clear all typing indicator intervals
+    // Clear all typing indicator intervals before the best-effort flush so
+    // the user sees activity stop while we're finalizing state.
     for (const interval of this.typingIntervals.values()) {
       clearInterval(interval);
     }
     this.typingIntervals.clear();
+
+    // Phase 2: best-effort flush of user-visible in-flight state, bounded by
+    // SHUTDOWN_GRACE_MS so we fit inside Docker's stop-grace window.
+    await Promise.race([
+      this.flushInflightStateOnShutdown(),
+      new Promise<void>((r) => setTimeout(r, ChannelHub.SHUTDOWN_GRACE_MS)),
+    ]);
 
     for (const throttler of this.chunkThrottlers.values()) {
       await throttler.flush();
@@ -646,6 +657,111 @@ export class ChannelHub {
 
     await Promise.all(Array.from(this.adapters.values()).map((adapter) => adapter.stop()));
     this.logger.info("ChannelHub stopped.");
+  }
+
+  /**
+   * Best-effort cleanup of user-visible Telegram state for in-flight executions.
+   * Called from `stop()` under a bounded timeout to avoid orphan ⏳ drafts,
+   * dangling 👀 reactions, and unsfinalized tool-activity messages after the
+   * process exits (e.g. SIGTERM during Railway redeploy).
+   *
+   * All operations are best-effort: failures are swallowed so one bad adapter
+   * call can't abort the rest of the cleanup.
+   */
+  private async flushInflightStateOnShutdown(): Promise<void> {
+    // Let any in-flight per-execution event chain finish so streamDrafts /
+    // toolActivityMessages reach a stable state before we read them.
+    try {
+      await Promise.allSettled(Array.from(this.eventQueues.values()));
+    } catch { /* best-effort */ }
+
+    const tasks: Promise<unknown>[] = [];
+
+    // Snapshot entries before iterating — best-effort cleanup may race with
+    // late event handlers that mutate these maps.
+    const streamDraftEntries = Array.from(this.streamDrafts.entries());
+    const reactionEntries = Array.from(this.reactionMessageIds.entries());
+    const toolActivityEntries = Array.from(this.toolActivityMessages.entries());
+
+    // 1. Finalize any visible streaming drafts so they don't disappear when the
+    //    ephemeral draft expires after the process exits.
+    for (const [draftKey, draft] of streamDraftEntries) {
+      const parts = draftKey.split(":");
+      // draftKey format: "channelId:chatId:executionId" — chatId may itself
+      // contain ":" in Slack-style ids, so take channel from front, executionId
+      // from back, and everything in the middle as chatId.
+      if (parts.length < 3) continue;
+      const channelId = parts[0];
+      const executionId = parts[parts.length - 1];
+      const chatId = parts.slice(1, -1).join(":");
+      const adapter = this.adapters.get(channelId);
+      if (!adapter || !draft.text.trim()) continue;
+
+      const topicId = this.getTopicId(channelId, chatId, executionId);
+      if (draft.messageId && adapter.editMessage) {
+        tasks.push(
+          adapter.editMessage(chatId, draft.messageId, markdownToTelegramHtml(draft.text)).catch(() => { /* best-effort */ })
+        );
+      } else if (adapter.sendMessage) {
+        // No visible draft yet — send the accumulated text as a new message so
+        // it isn't lost when the draft would have expired.
+        tasks.push(
+          (topicId && adapter.sendMessageWithMarkup
+            ? adapter.sendMessageWithMarkup(chatId, markdownToTelegramHtml(draft.text), undefined, { threadId: topicId })
+            : adapter.sendMessage(chatId, markdownToTelegramHtml(draft.text))
+          ).catch(() => { /* best-effort */ })
+        );
+      }
+    }
+
+    // 2. Clear any dangling reactions (⏳ from queued / 👀 from start) on the
+    //    user's source messages so they don't sit indefinitely after exit.
+    for (const [executionId, msgId] of reactionEntries) {
+      // Look up the adapter via the eventQueues map (key matches executionId)
+      // — fall back to scanning adapters since we don't have channelId here.
+      // The reaction map is keyed only by executionId, so we have to resolve
+      // channelId via the executionRegistry record.
+      const record = this.executionRegistry.get(executionId);
+      if (!record) continue;
+      const adapter = this.adapters.get(record.channelId);
+      if (!adapter?.setMessageReaction) continue;
+      tasks.push(
+        adapter.setMessageReaction(record.chatId, msgId, null).catch(() => { /* best-effort */ })
+      );
+    }
+
+    // 3. Finalize tool-activity messages (edit them into the collapsed summary
+    //    or delete if empty) so the user doesn't see a permanently "Working…"
+    //    status hanging around.
+    for (const [activityKey, activity] of toolActivityEntries) {
+      const parts = activityKey.split(":");
+      if (parts.length < 3) continue;
+      const channelId = parts[0];
+      const executionId = parts[parts.length - 1];
+      const chatId = parts.slice(1, -1).join(":");
+      const adapter = this.adapters.get(channelId);
+      if (!adapter || !activity.promoted || !activity.messageId) continue;
+
+      if (activity.tools.length > 0 && adapter.editMessage) {
+        const record = this.executionRegistry.get(executionId);
+        const summary = renderActivity({
+          status: "error",
+          tools: activity.tools,
+          executionId,
+          durationMs: record?.startedAt ? Date.now() - record.startedAt : undefined,
+          errorReason: "Interrupted by shutdown.",
+        });
+        tasks.push(
+          adapter.editMessage(chatId, activity.messageId, summary).catch(() => { /* best-effort */ })
+        );
+      } else if (adapter.deleteMessage) {
+        tasks.push(
+          adapter.deleteMessage(chatId, activity.messageId).catch(() => { /* best-effort */ })
+        );
+      }
+    }
+
+    await Promise.allSettled(tasks);
   }
 
   private subscribeEvents(): void {
@@ -1148,6 +1264,42 @@ export class ChannelHub {
 
   private async forwardEvent(adapter: IMAdapter, event: ExecutionEvent): Promise<void> {
     const topicId = this.getTopicId(event.channelId, event.chatId, event.executionId);
+
+    // Stale-resume retry from CliRuntime: drop hub-side stream state from the
+    // failed attempt so the retry's events don't interleave with leftover
+    // content from the first run. We don't clear `reactionMessageIds` — the
+    // 👀 reaction set on the source message is fine to keep through the retry,
+    // and dropping it would prevent the eventual `complete` handler from
+    // clearing the reaction.
+    if (event.type === "retry-reset") {
+      const draftKey = `${event.channelId}:${event.chatId}:${event.executionId}`;
+      const stranded = this.streamDrafts.get(draftKey);
+
+      // If the failed attempt already promoted a draft to a real Telegram
+      // message (e.g. a tool-use event triggered an early flush), best-effort
+      // delete that message so it doesn't sit alongside the retry's output as
+      // a duplicate fragment. Messages sent via plain `sendMessage` (no
+      // returned messageId) can't be recovered — accept that as cost of the
+      // synchronous retry path.
+      if (stranded?.messageId && adapter.deleteMessage) {
+        adapter.deleteMessage(event.chatId, stranded.messageId).catch(() => { /* non-critical */ });
+      }
+
+      this.streamDrafts.delete(draftKey);
+      this.completionPending.delete(event.executionId);
+      this.alreadyFlushed.delete(event.executionId);
+
+      const activityKey = `${event.channelId}:${event.chatId}:${event.executionId}`;
+      const activity = this.toolActivityMessages.get(activityKey);
+      if (activity) {
+        if (activity.promotionTimer) clearTimeout(activity.promotionTimer);
+        if (activity.promoted && activity.messageId && adapter.deleteMessage) {
+          adapter.deleteMessage(event.chatId, activity.messageId).catch(() => { /* non-critical */ });
+        }
+        this.toolActivityMessages.delete(activityKey);
+      }
+      return;
+    }
 
     // Handle queued — react with hourglass to show the message is waiting
     if (event.type === "queued") {

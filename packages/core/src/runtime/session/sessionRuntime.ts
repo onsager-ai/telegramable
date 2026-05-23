@@ -52,10 +52,11 @@ export class SessionRuntime implements Runtime {
 
     const response = await session.send(message.text, executionId, eventBus);
 
-    // Persist the session resume ID so conversations survive restarts
+    // Persist the session resume ID so conversations survive restarts.
+    // Stamp lastUsedAt so the next process can apply idle eviction across restarts.
     if (session.resumeId && this.fileStore) {
       const storeKey = `${message.channelId}::${message.chatId}::${this.config.name}`;
-      this.fileStore.set(storeKey, session.resumeId);
+      this.fileStore.set(storeKey, session.resumeId, Date.now());
     }
 
     if (!response) {
