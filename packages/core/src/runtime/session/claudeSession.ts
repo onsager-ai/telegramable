@@ -2,7 +2,20 @@ import { randomUUID } from "crypto";
 import { AgentConfig } from "../../config";
 import { EventBus } from "../../events/eventBus";
 import { NativeSessionState, AgentSession } from "./types";
-import { CommandRunner, parseNativeId, spawnAndStream, stripAnsi } from "./utils";
+import { NdjsonRunner, spawnAndStreamNdjson } from "./utils";
+
+interface CliEvent {
+  type?: string;
+  subtype?: string;
+  session_id?: string;
+  parent_tool_use_id?: string | null;
+  result?: string;
+  is_error?: boolean;
+  event?: {
+    type?: string;
+    delta?: { type?: string; text?: string };
+  };
+}
 
 export class ClaudeSession implements AgentSession {
   readonly sessionId = randomUUID();
@@ -20,7 +33,7 @@ export class ClaudeSession implements AgentSession {
     readonly channelId: string,
     readonly chatId: string,
     private readonly config: AgentConfig,
-    private readonly run: CommandRunner = spawnAndStream
+    private readonly run: NdjsonRunner = spawnAndStreamNdjson
   ) { }
 
   async send(userText: string, executionId: string, eventBus: EventBus): Promise<string> {
@@ -44,9 +57,17 @@ export class ClaudeSession implements AgentSession {
     const args = [
       ...(this.config.args || []),
       ...(resumeId ? ["--resume", resumeId] : []),
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
       "-p",
       userText
     ];
+
+    let finalText = "";
+    let resultIsError = false;
+    let resultArrived = false;
 
     const result = await this.run(
       this.config.command,
@@ -56,14 +77,65 @@ export class ClaudeSession implements AgentSession {
         env: this.config.env,
         timeoutMs: this.config.timeoutMs
       },
-      (type, text) => {
+      (raw) => {
+        const evt = raw as CliEvent | null;
+        if (!evt || typeof evt !== "object") return;
+
+        // Capture native session id on first observation (first-message turns only).
+        // Stream-json puts session_id on every event, so the system/init event is
+        // the canonical source but any earlier event would also work.
+        if (!resumeId && !this.state && typeof evt.session_id === "string" && evt.session_id.length > 0) {
+          this.state = { strategy: "native", nativeSessionId: evt.session_id };
+        }
+
+        if (evt.type === "stream_event" && evt.event?.type === "content_block_delta") {
+          const delta = evt.event.delta;
+          if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
+            eventBus.emit({
+              executionId,
+              channelId: this.channelId,
+              chatId: this.chatId,
+              type: "stream-text",
+              timestamp: Date.now(),
+              payload: {
+                text: delta.text,
+                parentToolUseId: evt.parent_tool_use_id ?? undefined
+              }
+            });
+          }
+          return;
+        }
+
+        if (evt.type === "result") {
+          resultArrived = true;
+          resultIsError = evt.is_error === true;
+          finalText = typeof evt.result === "string" ? evt.result : "";
+          eventBus.emit({
+            executionId,
+            channelId: this.channelId,
+            chatId: this.chatId,
+            type: "response-end",
+            timestamp: Date.now(),
+            payload: {
+              text: finalText,
+              ...(resultIsError ? { reason: "error" } : {})
+            }
+          });
+          return;
+        }
+
+        // Other events (system init, assistant full message echo, user tool_result
+        // echo, rate_limit_event, hook lifecycle) carry no user-visible signal here
+        // and are intentionally ignored.
+      },
+      (stderrChunk) => {
         eventBus.emit({
           executionId,
           channelId: this.channelId,
           chatId: this.chatId,
-          type,
+          type: "stderr",
           timestamp: Date.now(),
-          payload: { text }
+          payload: { text: stderrChunk }
         });
       }
     );
@@ -72,15 +144,14 @@ export class ClaudeSession implements AgentSession {
       throw new Error(result.stderr || `Claude command exited with code ${result.code ?? "unknown"}.`);
     }
 
-    const cleaned = stripAnsi(result.stdout).trim();
-
-    if (!resumeId) {
-      const nativeSessionId = parseNativeId(cleaned);
-      if (nativeSessionId) {
-        this.state = { strategy: "native", nativeSessionId };
-      }
+    if (!resultArrived) {
+      throw new Error("Claude CLI exited without a result event.");
     }
 
-    return cleaned;
+    if (resultIsError) {
+      throw new Error(finalText || "Claude CLI reported an error result.");
+    }
+
+    return finalText;
   }
 }

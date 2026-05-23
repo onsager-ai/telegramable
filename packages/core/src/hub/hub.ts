@@ -538,7 +538,8 @@ export class ChannelHub {
   private readonly permissionBridge: PermissionBridge;
   private readonly topicMap = new Map<string, number>(); // "channelId:chatId:executionId" → topicId
   private readonly streamDrafts = new Map<string, { text: string; messageId?: number; draftId?: number; draftFailed?: boolean }>(); // for streaming text accumulation
-  private readonly completionPending = new Set<string>(); // executionIds whose complete/error event is already queued — used to short-circuit pending stream-text sends
+  private readonly completionPending = new Set<string>(); // executionIds whose complete/error/response-end event is already queued — used to short-circuit pending stream-text sends
+  private readonly alreadyFlushed = new Set<string>(); // executionIds whose draft was already finalized by a `response-end` event — the later `complete` event must not re-send the response
   private draftIdCounter = 0; // monotonic counter for Telegram draft IDs
   private readonly typingIntervals = new Map<string, ReturnType<typeof setInterval>>(); // periodic typing indicators
   private readonly toolActivityMessages = new Map<string, { executionId: string; tools: ActivityTool[]; messageId?: number; promotionTimer?: ReturnType<typeof setTimeout>; promoted: boolean; sendingPromise?: Promise<void> }>(); // tool activity tracking
@@ -636,6 +637,7 @@ export class ChannelHub {
     this.reactionMessageIds.clear();
     this.streamDrafts.clear();
     this.completionPending.clear();
+    this.alreadyFlushed.clear();
 
     // Clean up any downloaded files from in-flight executions
     for (const executionId of Array.from(this.downloadedFiles.keys())) {
@@ -670,7 +672,13 @@ export class ChannelHub {
       // one exists, or by sending a new message if streaming was short-
       // circuited before any draft send — avoiding a visible delay between
       // the end of streaming and the draft→permanent transition.
-      if (event.type === "complete" || event.type === "error") {
+      //
+      // `response-end` is the Claude CLI stream-json signal that the assistant
+      // turn is logically finished (received ahead of process exit). Treating
+      // it as pending lets us flush the draft seconds before `complete` would
+      // otherwise fire, so the ephemeral Telegram draft can't expire on the
+      // CLI's shutdown tail.
+      if (event.type === "complete" || event.type === "error" || event.type === "response-end") {
         this.completionPending.add(event.executionId);
       }
 
@@ -1205,6 +1213,28 @@ export class ChannelHub {
       return;
     }
 
+    // Early draft finalization — the Claude CLI stream-json `result` event tells us
+    // the assistant turn is logically done, ahead of the CLI's multi-second shutdown
+    // tail. Flush the draft to a permanent message immediately so the ephemeral
+    // Telegram draft can't expire while we wait for `complete`.
+    if (event.type === "response-end") {
+      this.stopTypingIndicator(event.channelId, event.chatId, event.executionId);
+      const draftKey = `${event.channelId}:${event.chatId}:${event.executionId}`;
+      const draft = this.streamDrafts.get(draftKey);
+      if (draft && draft.text.trim().length > 0) {
+        try {
+          await this.flushStreamDraft(adapter, event.channelId, event.chatId, event.executionId, topicId);
+        } catch {
+          // Best-effort — flushStreamDraft cleans up its own state in `finally`.
+        }
+        // Mark as flushed so the later `complete` event skips the duplicate flush
+        // and the duplicate response send. Set even on flush failure, since the
+        // draft may already be partially visible — re-sending would duplicate.
+        this.alreadyFlushed.add(event.executionId);
+      }
+      return;
+    }
+
     if (event.type === "complete" || event.type === "error") {
       // Always stop typing indicator on completion
       this.stopTypingIndicator(event.channelId, event.chatId, event.executionId);
@@ -1213,6 +1243,12 @@ export class ChannelHub {
       // (It was set synchronously in subscribeEvents so earlier queued
       // stream-text events could skip their sendMessageDraft calls.)
       this.completionPending.delete(event.executionId);
+
+      // If `response-end` already finalized the draft, skip the flush and the
+      // duplicate-response send path. The cleanup (summary, topic close,
+      // reaction clear, tool-activity finalize) still runs.
+      const wasAlreadyFlushed = this.alreadyFlushed.has(event.executionId);
+      this.alreadyFlushed.delete(event.executionId);
 
       // Check if the response is already visible via a streaming draft.
       // If so, flush it IMMEDIATELY — before any other Telegram API calls —
@@ -1225,7 +1261,7 @@ export class ChannelHub {
       const draft = this.streamDrafts.get(draftKey);
       const hasDraftContent = draft && draft.text.trim().length > 0;
 
-      if (hasDraftContent) {
+      if (hasDraftContent && !wasAlreadyFlushed) {
         try {
           await this.flushStreamDraft(adapter, event.channelId, event.chatId, event.executionId, topicId);
         } catch {
@@ -1251,8 +1287,9 @@ export class ChannelHub {
         });
       }
 
-      if (hasDraftContent) {
-        // Draft was already flushed above — send error text and summary after it
+      if (hasDraftContent || wasAlreadyFlushed) {
+        // Draft was already flushed (either above or by response-end) — send
+        // error text and summary after it.
         if (event.type === "error") {
           const text = formatEvent(event);
           if (text) {
