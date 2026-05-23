@@ -8,6 +8,7 @@ export type ExecutionEventType =
   | "permission-request"
   | "permission-response"
   | "stream-text"
+  | "response-end"
   | "tool-use"
   | "thinking"
   | "turn-complete";

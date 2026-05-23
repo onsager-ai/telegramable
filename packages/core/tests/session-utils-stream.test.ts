@@ -1,6 +1,9 @@
 import assert from "assert";
 import test from "node:test";
-import { spawnAndCollect, spawnAndStream } from "../src/runtime/session/utils";
+import { writeFileSync, unlinkSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { spawnAndCollect, spawnAndStream, spawnAndStreamNdjson } from "../src/runtime/session/utils";
 
 test("spawnAndStream forwards stdout and stderr chunks", async () => {
   const chunks: Array<{ type: "stdout" | "stderr"; text: string }> = [];
@@ -87,6 +90,52 @@ test("spawnAndStream activity-based timeout resets on output", async () => {
 
   assert.equal(result.code, 0, "should complete without timeout");
   assert.ok(result.stdout.includes("tick3"), "should have received all ticks");
+});
+
+test("spawnAndStreamNdjson reassembles lines split across stdout chunks", async () => {
+  const events: unknown[] = [];
+  // Write a generator script to a tmp file — embedding the JS source in `-e`
+  // alongside the test's own shell quoting is brittle because the inner JSON
+  // strings contain both single and double quotes. The script writes
+  // `{"a":1}\n{"b":` then `2}\n` (completes a line started in the first chunk)
+  // then `not json\n{"c":3}\n` (verifies non-JSON lines are silently dropped).
+  const scriptPath = join(tmpdir(), `ndjson-test-${Date.now()}.js`);
+  writeFileSync(scriptPath, [
+    `process.stdout.write('{"a":1}\\n{"b":');`,
+    `setTimeout(() => process.stdout.write('2}\\n'), 30);`,
+    `setTimeout(() => process.stdout.write('not json\\n{"c":3}\\n'), 60);`,
+  ].join("\n"));
+
+  try {
+    const result = await spawnAndStreamNdjson(
+      `node ${scriptPath}`,
+      [],
+      { timeoutMs: 2_000 },
+      (event) => { events.push(event); }
+    );
+
+    assert.equal(result.code, 0);
+    assert.deepEqual(events, [{ a: 1 }, { b: 2 }, { c: 3 }]);
+  } finally {
+    try { unlinkSync(scriptPath); } catch { /* best-effort */ }
+  }
+});
+
+test("spawnAndStreamNdjson forwards stderr as text", async () => {
+  const stderrChunks: string[] = [];
+  const script = "process.stderr.write('warn1'); process.stderr.write(' warn2')";
+
+  const result = await spawnAndStreamNdjson(
+    `node -e "${script}"`,
+    [],
+    { timeoutMs: 2_000 },
+    undefined,
+    (text) => { stderrChunks.push(text); }
+  );
+
+  assert.equal(result.code, 0);
+  assert.equal(result.stderr, "warn1 warn2");
+  assert.ok(stderrChunks.length > 0);
 });
 
 test("spawnAndCollect activity-based timeout resets on output", async () => {
