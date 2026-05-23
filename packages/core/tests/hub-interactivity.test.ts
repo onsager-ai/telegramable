@@ -745,8 +745,45 @@ test("renderActivity: single running tool shows step count and current cue but n
   assert.ok(out.includes("· ▸"), "current tool cue while running");
   assert.ok(out.includes("<b>Read</b>"), "tool display name");
   assert.ok(out.includes("<code>a.ts</code>"), "primary arg is basename in code");
-  assert.ok(!out.includes("<blockquote"), "running state skips blockquote to keep edits short");
+  assert.ok(!out.includes("<blockquote"), "running state skips blockquote for non-Bash tools to keep edits short");
   assert.ok(!out.includes("Reading"), "no verb-based descriptor in unified template");
+});
+
+test("renderActivity: running Bash with short command renders expandable <pre> block, no inline <code>", () => {
+  const out = renderActivity({
+    status: "running",
+    tools: [{ name: "Bash", input: { command: "ls -la" } }],
+    executionId: "x-bash-short",
+  });
+  assert.ok(out.includes("⚙️ <b>Working</b>"), "running header");
+  assert.ok(out.includes("⚡1"), "counter line with bash=1");
+  assert.ok(out.includes("· ▸ <b>Bash</b>"), "counter line ends with bold Bash, no trailing inline <code>");
+  assert.ok(
+    out.includes(`<blockquote expandable><pre><code class="language-bash">ls -la</code></pre></blockquote>`),
+    "command body wrapped in expandable blockquote with language-bash hint",
+  );
+  // Counter line must not carry the command inline.
+  const counterLine = out.split("\n").find((l) => l.includes("⚡1"));
+  assert.ok(counterLine && !counterLine.includes("<code>"), "no inline <code> on counter line for Bash");
+});
+
+test("renderActivity: running Bash with multi-line command preserves newlines and escapes HTML once", () => {
+  const command = "cat <<'EOF' | jq '.items[] | select(.x > 1)'\n{\"items\": [{\"x\": 2}]}\nEOF";
+  const out = renderActivity({
+    status: "running",
+    tools: [{ name: "Bash", input: { command } }],
+    executionId: "x-bash-multi",
+  });
+  assert.ok(
+    out.includes(`<blockquote expandable><pre><code class="language-bash">`),
+    "expandable blockquote+pre wrapper present",
+  );
+  // Newlines preserved verbatim inside the <pre> block.
+  assert.ok(out.includes("[{\"x\": 2}]}\nEOF"), "newline between heredoc body and closing delimiter preserved");
+  assert.ok(out.includes("EOF</code></pre></blockquote>"), "trailing EOF then closing tags");
+  // HTML escape applied once: > becomes &gt;, never &amp;gt;.
+  assert.ok(out.includes(".x &gt; 1"), "angle bracket escaped to &gt;");
+  assert.ok(!out.includes("&amp;gt;"), "no double-escaping");
 });
 
 test("renderActivity: single done tool drops current cue, shows duration, and renders ✓-prefixed step", () => {

@@ -452,8 +452,22 @@ export const renderActivity = (state: RenderActivityState): string => {
     const counters = formatCategoryCounters(visibleTools);
     if (state.status === "running") {
       const lastTool = visibleTools[visibleTools.length - 1];
-      const currentDesc = formatToolDescription(lastTool.name, lastTool.input);
-      lines.push(`${counters} · ▸ ${currentDesc}`);
+      // Bash commands can be long (heredocs, jq pipelines, npm/docker invocations)
+      // and overrun mobile widths when rendered inline. Move the command body
+      // into an expandable <blockquote><pre> so ≥4-line commands collapse and
+      // shorter ones stay visually contained inside the quote.
+      if (categorizeToolName(lastTool.name) === "bash") {
+        const { name, arg } = formatToolDisplay(lastTool.name, lastTool.input);
+        lines.push(`${counters} · ▸ <b>${escapeHtml(name)}</b>`);
+        if (arg) {
+          lines.push(
+            `<blockquote expandable><pre><code class="language-bash">${escapeHtml(arg)}</code></pre></blockquote>`,
+          );
+        }
+      } else {
+        const currentDesc = formatToolDescription(lastTool.name, lastTool.input);
+        lines.push(`${counters} · ▸ ${currentDesc}`);
+      }
     } else {
       lines.push(counters);
     }
