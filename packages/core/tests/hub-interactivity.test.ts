@@ -1115,3 +1115,195 @@ test("ChannelHub.stop clears reactions on in-flight executions", async () => {
   assert.ok(clearedReactions.some((r) => r.messageId === 42),
     "the source message reaction must be cleared on shutdown");
 });
+
+// --- Issue #104: user-visible cleanup moves to response-end ---------------
+//
+// Tier A cleanup (reaction clear, tool-activity finalize, throttler flush)
+// should happen the moment the reply settles — i.e. on `response-end` —
+// so the chat stops mutating during the CLI's multi-second shutdown tail.
+// The later `complete`/`error` event must be a no-op for Tier A so the
+// blockquote isn't re-edited and the reaction isn't re-cleared.
+
+test("response-end runs Tier A cleanup (reaction, tool-activity, throttler) before complete", async () => {
+  const eventBus = new EventBus();
+  const logger = createLogger("error");
+  const adapter = new MockAdapter("telegram");
+
+  const reactions: Array<{ messageId: number; emoji: string | null; at: number }> = [];
+  (adapter as unknown as { setMessageReaction: (chatId: string, messageId: number, emoji: string | null) => Promise<void> })
+    .setMessageReaction = async (_chatId, messageId, emoji) => {
+      reactions.push({ messageId, emoji, at: Date.now() });
+    };
+
+  let responseEndAt = 0;
+  let completeAt = 0;
+
+  const runtime: Runtime = {
+    async execute(message, executionId, bus): Promise<void> {
+      const base = { executionId, channelId: message.channelId, chatId: message.chatId };
+
+      bus.emit({ ...base, type: "start", timestamp: 1000, payload: { agentName: "claude", messageId: 77 } });
+      // Stream a bit so there's a draft to flush at response-end
+      bus.emit({ ...base, type: "stream-text", timestamp: 1500, payload: { text: "Hello." } });
+      await sleep(20);
+      bus.emit({ ...base, type: "response-end", timestamp: 2000, payload: {} });
+      responseEndAt = Date.now();
+
+      // Simulate CLI shutdown tail — `complete` arrives several ticks later.
+      await sleep(50);
+      completeAt = Date.now();
+      bus.emit({ ...base, type: "complete", timestamp: 2500, payload: { response: "Hello." } });
+    }
+  };
+
+  const router: Router = { select(message) { return { runtime, message }; } };
+  const hub = new ChannelHub([adapter], router, eventBus, logger);
+  await hub.start();
+
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "hi" });
+  await sleep(150);
+
+  // The 👀 reaction should have been cleared (emoji=null), and that clear
+  // should have happened around `response-end`, not later at `complete`.
+  const cleared = reactions.find((r) => r.messageId === 77 && r.emoji === null);
+  assert.ok(cleared, "response-end should clear the 👀 reaction on the source message");
+  assert.ok(
+    cleared!.at < completeAt,
+    `reaction clear should happen before complete (cleared=${cleared!.at}, complete=${completeAt}, response-end=${responseEndAt})`
+  );
+
+  // Exactly one clear — complete must not re-clear after response-end did.
+  const allClearsForMsg = reactions.filter((r) => r.messageId === 77 && r.emoji === null);
+  assert.equal(allClearsForMsg.length, 1, "complete must not re-clear the reaction that response-end already cleared");
+
+  await hub.stop();
+});
+
+test("complete without prior response-end still runs Tier A cleanup (fallback path)", async () => {
+  const eventBus = new EventBus();
+  const logger = createLogger("error");
+  const adapter = new MockAdapter("telegram");
+
+  const reactions: Array<{ messageId: number; emoji: string | null }> = [];
+  (adapter as unknown as { setMessageReaction: (chatId: string, messageId: number, emoji: string | null) => Promise<void> })
+    .setMessageReaction = async (_chatId, messageId, emoji) => {
+      reactions.push({ messageId, emoji });
+    };
+
+  const runtime: Runtime = {
+    async execute(message, executionId, bus): Promise<void> {
+      const base = { executionId, channelId: message.channelId, chatId: message.chatId };
+      bus.emit({ ...base, type: "start", timestamp: 1000, payload: { agentName: "claude", messageId: 88 } });
+      bus.emit({ ...base, type: "stream-text", timestamp: 1500, payload: { text: "Hello." } });
+      await sleep(20);
+      // No response-end — CLI killed before result. complete must still clear.
+      bus.emit({ ...base, type: "complete", timestamp: 2000, payload: { response: "Hello." } });
+    }
+  };
+
+  const router: Router = { select(message) { return { runtime, message }; } };
+  const hub = new ChannelHub([adapter], router, eventBus, logger);
+  await hub.start();
+
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "hi" });
+  await sleep(100);
+
+  const cleared = reactions.find((r) => r.messageId === 88 && r.emoji === null);
+  assert.ok(cleared, "complete must clear the reaction when response-end never arrived");
+
+  await hub.stop();
+});
+
+test("error after response-end still renders error text and does not re-run Tier A", async () => {
+  const eventBus = new EventBus();
+  const logger = createLogger("error");
+  const adapter = new MockAdapter("telegram");
+
+  const reactions: Array<{ messageId: number; emoji: string | null }> = [];
+  (adapter as unknown as { setMessageReaction: (chatId: string, messageId: number, emoji: string | null) => Promise<void> })
+    .setMessageReaction = async (_chatId, messageId, emoji) => {
+      reactions.push({ messageId, emoji });
+    };
+
+  const runtime: Runtime = {
+    async execute(message, executionId, bus): Promise<void> {
+      const base = { executionId, channelId: message.channelId, chatId: message.chatId };
+      bus.emit({ ...base, type: "start", timestamp: 1000, payload: { agentName: "claude", messageId: 99 } });
+      bus.emit({ ...base, type: "stream-text", timestamp: 1500, payload: { text: "Partial reply." } });
+      await sleep(20);
+      bus.emit({ ...base, type: "response-end", timestamp: 2000, payload: {} });
+      await sleep(30);
+      bus.emit({ ...base, type: "error", timestamp: 2500, payload: { reason: "boom" } });
+    }
+  };
+
+  const router: Router = { select(message) { return { runtime, message }; } };
+  const hub = new ChannelHub([adapter], router, eventBus, logger);
+  await hub.start();
+
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "hi" });
+  await sleep(150);
+
+  // Tier A cleanup ran exactly once (on response-end), not twice
+  const allClears = reactions.filter((r) => r.messageId === 99 && r.emoji === null);
+  assert.equal(allClears.length, 1, "error after response-end must not re-clear the reaction");
+
+  // Error text still rendered after the draft was already flushed
+  const errorMsg = adapter.sentMessages.find((m) => m.text.includes("boom") || m.text.toLowerCase().includes("error"));
+  assert.ok(errorMsg, "error text should still render after response-end ran Tier A cleanup");
+
+  await hub.stop();
+});
+
+test("retry-reset clears cleanupDone so the retry's response-end can run Tier A again", async () => {
+  const eventBus = new EventBus();
+  const logger = createLogger("error");
+  const adapter = new MockAdapter("telegram");
+
+  const reactions: Array<{ messageId: number; emoji: string | null }> = [];
+  (adapter as unknown as { setMessageReaction: (chatId: string, messageId: number, emoji: string | null) => Promise<void> })
+    .setMessageReaction = async (_chatId, messageId, emoji) => {
+      reactions.push({ messageId, emoji });
+    };
+
+  const runtime: Runtime = {
+    async execute(message, executionId, bus): Promise<void> {
+      const base = { executionId, channelId: message.channelId, chatId: message.chatId };
+      bus.emit({ ...base, type: "start", timestamp: 1000, payload: { agentName: "claude", messageId: 55 } });
+      bus.emit({ ...base, type: "stream-text", timestamp: 1500, payload: { text: "First attempt." } });
+      await sleep(20);
+      bus.emit({ ...base, type: "response-end", timestamp: 2000, payload: {} });
+      await sleep(20);
+      // Stale-resume retry: drop hub-side stream state, including cleanupDone,
+      // so the retry's own response-end isn't a no-op.
+      bus.emit({ ...base, type: "retry-reset", timestamp: 2100, payload: {} });
+      await sleep(10);
+      bus.emit({ ...base, type: "stream-text", timestamp: 2200, payload: { text: "Retry reply." } });
+      await sleep(20);
+      bus.emit({ ...base, type: "response-end", timestamp: 2400, payload: {} });
+      await sleep(20);
+      bus.emit({ ...base, type: "complete", timestamp: 2500, payload: { response: "Retry reply." } });
+    }
+  };
+
+  const router: Router = { select(message) { return { runtime, message }; } };
+  const hub = new ChannelHub([adapter], router, eventBus, logger);
+  await hub.start();
+
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "hi" });
+  await sleep(200);
+
+  // retry-reset deletes the reactionMessageId, so the post-retry response-end
+  // has nothing to clear. The important guarantee is: complete must not
+  // re-clear after response-end ran cleanup, OR re-edit the (now deleted)
+  // tool-activity blockquote. With cleanupDone properly cleared on
+  // retry-reset, the second response-end runs cleanly and complete is a
+  // no-op for Tier A.
+  // We assert: the first response-end's clear happened, and complete didn't
+  // produce extra clears beyond what response-end produced.
+  const allClears = reactions.filter((r) => r.messageId === 55 && r.emoji === null);
+  assert.ok(allClears.length >= 1, "first response-end should have cleared the 👀 reaction");
+  assert.ok(allClears.length <= 1, "complete must not re-clear after response-end already did");
+
+  await hub.stop();
+});

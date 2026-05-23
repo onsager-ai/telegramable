@@ -540,6 +540,7 @@ export class ChannelHub {
   private readonly streamDrafts = new Map<string, { text: string; messageId?: number; draftId?: number; draftFailed?: boolean }>(); // for streaming text accumulation
   private readonly completionPending = new Set<string>(); // executionIds whose complete/error/response-end event is already queued — used to short-circuit pending stream-text sends
   private readonly alreadyFlushed = new Set<string>(); // executionIds whose draft was already finalized by a `response-end` event — the later `complete` event must not re-send the response
+  private readonly cleanupDone = new Set<string>(); // executionIds whose user-visible cleanup (reaction, tool-activity, throttler) ran early on `response-end` — the later `complete` event must skip those Tier-A steps to avoid re-mutation after the reply settles
   private draftIdCounter = 0; // monotonic counter for Telegram draft IDs
   private readonly typingIntervals = new Map<string, ReturnType<typeof setInterval>>(); // periodic typing indicators
   private readonly toolActivityMessages = new Map<string, { executionId: string; tools: ActivityTool[]; messageId?: number; promotionTimer?: ReturnType<typeof setTimeout>; promoted: boolean; sendingPromise?: Promise<void> }>(); // tool activity tracking
@@ -649,6 +650,7 @@ export class ChannelHub {
     this.streamDrafts.clear();
     this.completionPending.clear();
     this.alreadyFlushed.clear();
+    this.cleanupDone.clear();
 
     // Clean up any downloaded files from in-flight executions
     for (const executionId of Array.from(this.downloadedFiles.keys())) {
@@ -1288,6 +1290,7 @@ export class ChannelHub {
       this.streamDrafts.delete(draftKey);
       this.completionPending.delete(event.executionId);
       this.alreadyFlushed.delete(event.executionId);
+      this.cleanupDone.delete(event.executionId);
 
       const activityKey = `${event.channelId}:${event.chatId}:${event.executionId}`;
       const activity = this.toolActivityMessages.get(activityKey);
@@ -1384,6 +1387,15 @@ export class ChannelHub {
         // draft may already be partially visible — re-sending would duplicate.
         this.alreadyFlushed.add(event.executionId);
       }
+
+      // Tier A user-visible cleanup — runs here so the chat goes still the
+      // moment the reply settles, instead of continuing to mutate during the
+      // CLI's multi-second shutdown tail. The later `complete`/`error` event
+      // skips these via `cleanupDone`. Tier B (summary, topic close, file
+      // cleanup) stays on `complete` since it depends on final record state or
+      // on the agent process having exited.
+      await this.runVisibleCleanup(adapter, event.channelId, event.chatId, event.executionId);
+      this.cleanupDone.add(event.executionId);
       return;
     }
 
@@ -1397,10 +1409,14 @@ export class ChannelHub {
       this.completionPending.delete(event.executionId);
 
       // If `response-end` already finalized the draft, skip the flush and the
-      // duplicate-response send path. The cleanup (summary, topic close,
-      // reaction clear, tool-activity finalize) still runs.
+      // duplicate-response send path. Tier B cleanup (summary, topic close,
+      // file cleanup) still runs; Tier A cleanup (reaction, tool-activity,
+      // throttler) is gated separately by `cleanupDone` so it isn't re-run
+      // when `response-end` already drove it.
       const wasAlreadyFlushed = this.alreadyFlushed.has(event.executionId);
       this.alreadyFlushed.delete(event.executionId);
+      const cleanupAlreadyDone = this.cleanupDone.has(event.executionId);
+      this.cleanupDone.delete(event.executionId);
 
       // Check if the response is already visible via a streaming draft.
       // If so, flush it IMMEDIATELY — before any other Telegram API calls —
@@ -1423,20 +1439,11 @@ export class ChannelHub {
         }
       }
 
-      // Non-time-sensitive cleanup — runs after the draft is already stabilized.
-      // Use allSettled so a failure in one doesn't abort the completion path.
-      await Promise.allSettled([
-        this.finalizeToolActivity(adapter, event.channelId, event.chatId, event.executionId),
-        this.flushAndDeleteThrottler(event.channelId, event.chatId),
-      ]);
-
-      // Clear reaction on the source message
-      const reactionMsgId = this.reactionMessageIds.get(event.executionId);
-      this.reactionMessageIds.delete(event.executionId);
-      if (reactionMsgId && adapter.setMessageReaction) {
-        adapter.setMessageReaction(event.chatId, reactionMsgId, null).catch(() => {
-          // Non-critical
-        });
+      // Tier A user-visible cleanup. Skipped if `response-end` already ran it —
+      // re-running would re-edit the tool-activity blockquote and re-clear an
+      // already-cleared reaction, causing the post-reply "after-shake".
+      if (!cleanupAlreadyDone) {
+        await this.runVisibleCleanup(adapter, event.channelId, event.chatId, event.executionId);
       }
 
       if (hasDraftContent || wasAlreadyFlushed) {
@@ -1664,6 +1671,28 @@ export class ChannelHub {
       activity.messageId = messageId;
     } else {
       await adapter.sendMessage(chatId, statusMsg);
+    }
+  }
+
+  /**
+   * Tier A cleanup — the user-visible mutations that should stop the moment
+   * the reply settles: finalize the tool-activity blockquote, drain the
+   * pending throttler, clear the 👀 reaction on the source message. Runs on
+   * `response-end` in the normal path and falls back to `complete`/`error`
+   * when `response-end` never arrived (CLI killed before `result`).
+   */
+  private async runVisibleCleanup(adapter: IMAdapter, channelId: string, chatId: string, executionId: string): Promise<void> {
+    await Promise.allSettled([
+      this.finalizeToolActivity(adapter, channelId, chatId, executionId),
+      this.flushAndDeleteThrottler(channelId, chatId),
+    ]);
+
+    const reactionMsgId = this.reactionMessageIds.get(executionId);
+    this.reactionMessageIds.delete(executionId);
+    if (reactionMsgId && adapter.setMessageReaction) {
+      adapter.setMessageReaction(chatId, reactionMsgId, null).catch(() => {
+        // Non-critical
+      });
     }
   }
 
