@@ -40,17 +40,32 @@ export class InMemorySessionManager implements SessionManager {
 
     const session = this.options.createSession(channelId, chatId, agentName);
 
-    // Restore persisted resume ID so the session continues a prior conversation
-    const persistedResumeId = this.fileStore?.get(key);
-    if (persistedResumeId && session.setResumeId) {
-      session.setResumeId(persistedResumeId);
-      this.options.logger.debug("Restored session resume ID from disk.", {
-        sessionId: session.sessionId,
-        resumeId: persistedResumeId,
-        channelId,
-        chatId,
-        agentName
-      });
+    // Restore persisted resume ID so the session continues a prior conversation,
+    // but skip restoration if the persisted entry is older than sessionTimeoutMs —
+    // a stale resume across a restart should reset just like an in-process idle.
+    const persisted = this.fileStore?.get(key);
+    if (persisted) {
+      const idleMs = this.now() - persisted.lastUsedAt;
+      if (idleMs > this.sessionTimeoutMs) {
+        this.fileStore?.delete(key);
+        this.options.logger.debug("Discarded stale persisted session.", {
+          sessionId: session.sessionId,
+          resumeId: persisted.id,
+          idleMs,
+          channelId,
+          chatId,
+          agentName
+        });
+      } else if (session.setResumeId) {
+        session.setResumeId(persisted.id);
+        this.options.logger.debug("Restored session resume ID from disk.", {
+          sessionId: session.sessionId,
+          resumeId: persisted.id,
+          channelId,
+          chatId,
+          agentName
+        });
+      }
     }
 
     this.sessions.set(key, {
@@ -103,6 +118,9 @@ export class InMemorySessionManager implements SessionManager {
 
     for (const entry of stale) {
       this.sessions.delete(entry.key);
+      // Drop the persisted resume ID too — otherwise a restart would restore
+      // a session we just decided is stale.
+      this.fileStore?.delete(entry.key);
       void entry.session.close().catch((error) => {
         this.options.logger.warn("Failed to close idle session.", {
           sessionId: entry.session.sessionId,

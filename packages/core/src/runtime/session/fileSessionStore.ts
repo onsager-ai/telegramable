@@ -2,16 +2,27 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, accessSync, constan
 import { dirname, resolve } from "path";
 import { Logger } from "../../logging";
 
+export interface FileSessionEntry {
+  id: string;
+  /** Epoch ms when this entry was last set or refreshed. `0` for legacy bare-string entries. */
+  lastUsedAt: number;
+}
+
 /**
  * Simple JSON file store for persisting session resume IDs across restarts.
  * Each runtime type gets its own file (e.g. "cli-sessions.json", "claude-sessions.json").
+ *
+ * Values are stored as `{ id, lastUsedAt }` so callers can implement idle eviction
+ * across process restarts. Legacy bare-string values are coerced to
+ * `{ id, lastUsedAt: 0 }` on load, which causes them to be treated as expired on
+ * first access — one natural reset, no migration script.
  *
  * If the target directory is not writable (e.g. Railway volume with wrong ownership),
  * the store operates in memory-only mode and logs a warning.
  */
 export class FileSessionStore {
   private readonly filePath: string | null;
-  private data: Record<string, string>;
+  private data: Record<string, FileSessionEntry>;
 
   constructor(dataDir: string, fileName: string, private readonly logger?: Logger) {
     const candidate = resolve(dataDir, fileName);
@@ -48,12 +59,12 @@ export class FileSessionStore {
     }
   }
 
-  get(key: string): string | undefined {
+  get(key: string): FileSessionEntry | undefined {
     return this.data[key];
   }
 
-  set(key: string, value: string): void {
-    this.data[key] = value;
+  set(key: string, id: string, lastUsedAt: number): void {
+    this.data[key] = { id, lastUsedAt };
     this.save();
   }
 
@@ -62,12 +73,27 @@ export class FileSessionStore {
     this.save();
   }
 
-  private load(): Record<string, string> {
+  private load(): Record<string, FileSessionEntry> {
     if (!this.filePath) return {};
     try {
       if (!existsSync(this.filePath)) return {};
       const raw = readFileSync(this.filePath, "utf-8");
-      return JSON.parse(raw);
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const normalized: Record<string, FileSessionEntry> = {};
+      for (const [key, value] of Object.entries(parsed)) {
+        if (typeof value === "string") {
+          // Legacy bare-string format: coerce to expired entry so the next access
+          // triggers idle reset rather than blindly resuming a stale session.
+          normalized[key] = { id: value, lastUsedAt: 0 };
+        } else if (value && typeof value === "object" && typeof (value as FileSessionEntry).id === "string") {
+          const entry = value as FileSessionEntry;
+          normalized[key] = {
+            id: entry.id,
+            lastUsedAt: typeof entry.lastUsedAt === "number" ? entry.lastUsedAt : 0
+          };
+        }
+      }
+      return normalized;
     } catch (error) {
       this.logger?.warn("Failed to load session store, starting fresh.", {
         filePath: this.filePath,

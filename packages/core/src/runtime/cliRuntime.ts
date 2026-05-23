@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { spawn } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdtempSync, chmodSync, rmdirSync, openSync, closeSync, constants as fsConstants } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -26,12 +26,27 @@ export interface CliRuntimeOptions {
 export class CliRuntime implements Runtime {
   /** Map of "channelId::chatId" → Claude CLI session ID for conversation continuity. */
   private readonly sessions = new Map<string, string>();
+  /**
+   * In-process hot cache of the last-used wall-clock time for each session key.
+   * Lifecycle MUST mirror `sessions` exactly — every site that deletes from
+   * `sessions` must also delete the matching `sessionLastUsedAt` entry, or a
+   * stale timestamp will survive a fresh `--session-id` and falsely mark the
+   * next turn idle.
+   */
+  private readonly sessionLastUsedAt = new Map<string, number>();
   /** Per-session execution queue to serialize sequential messages and prevent concurrent CLI processes on the same session. */
   private readonly executionQueues = new Map<string, Promise<void>>();
+  /** Live child processes — tracked so graceful shutdown can SIGTERM them. */
+  private readonly activeChildren = new Set<ChildProcess>();
   private readonly fileStore?: FileSessionStore;
   private readonly getSystemPromptSuffix?: () => string;
   private readonly memoryProvider?: MemoryProvider;
   private readonly useAgentDrivenMemory: boolean;
+
+  /** Idle threshold shared across the in-memory and persisted session caches. */
+  private get sessionTimeoutMs(): number {
+    return this.config.sessionTimeoutMs ?? 30 * 60 * 1000;
+  }
 
   /** Resolve the path to the compiled memoryMcpStdio.js once. */
   private memoryMcpStdioPath?: string;
@@ -312,7 +327,19 @@ export class CliRuntime implements Runtime {
       () => this._execute(message, executionId, eventBus, false),
       () => this._execute(message, executionId, eventBus, false)
     );
-    this.executionQueues.set(queueKey, next.catch(() => {}));
+    const tracked = next.catch(() => {});
+    this.executionQueues.set(queueKey, tracked);
+
+    // Mirror Hub.eventQueues' cleanup: once the queued chain settles, drop the
+    // entry if no later execution has taken its slot. Without this, every unique
+    // chat leaks one Map entry holding a settled-Promise reference for the rest
+    // of the process lifetime.
+    void tracked.then(() => {
+      if (this.executionQueues.get(queueKey) === tracked) {
+        this.executionQueues.delete(queueKey);
+      }
+    });
+
     return next;
   }
 
@@ -337,7 +364,29 @@ export class CliRuntime implements Runtime {
 
     return new Promise((resolve, reject) => {
       const sessionKey = `${message.channelId}::${message.chatId}`;
-      const existingSessionId = isRetry ? undefined : (this.sessions.get(sessionKey) || this.fileStore?.get(sessionKey));
+
+      // Idle reset: if the last turn for this key happened more than
+      // sessionTimeoutMs ago, treat the persisted session as expired and
+      // start fresh. The in-process map wins when populated (handles same-
+      // process reuse without disk I/O); we fall back to the persisted
+      // lastUsedAt across restarts. Skipped on retry — the retry path is
+      // already starting a fresh session by design.
+      let existingSessionId: string | undefined;
+      if (!isRetry) {
+        const inMemoryId = this.sessions.get(sessionKey);
+        const persisted = this.fileStore?.get(sessionKey);
+        const lastUsedAt = this.sessionLastUsedAt.get(sessionKey) ?? persisted?.lastUsedAt ?? 0;
+        const idleMs = Date.now() - lastUsedAt;
+
+        if ((inMemoryId || persisted) && idleMs > this.sessionTimeoutMs) {
+          this.logger.info("Resetting idle CLI session.", { sessionKey, idleMs, sessionTimeoutMs: this.sessionTimeoutMs });
+          this.sessions.delete(sessionKey);
+          this.fileStore?.delete(sessionKey);
+          this.sessionLastUsedAt.delete(sessionKey);
+        } else {
+          existingSessionId = inMemoryId || persisted?.id;
+        }
+      }
 
       const { executable, initialArgs } = this.parseCommand();
 
@@ -353,14 +402,20 @@ export class CliRuntime implements Runtime {
         args.push("--mcp-config", mcpFiles.mcpConfigPath);
       }
 
+      const sessionStartedAt = Date.now();
       if (existingSessionId) {
         args.push("--resume", existingSessionId);
         // Ensure in-memory map is populated (may have been loaded from file store)
         this.sessions.set(sessionKey, existingSessionId);
+        this.sessionLastUsedAt.set(sessionKey, sessionStartedAt);
+        // Refresh the persisted timestamp so idle eviction tracks the latest
+        // observed activity, not the very first time this session was created.
+        this.fileStore?.set(sessionKey, existingSessionId, sessionStartedAt);
       } else {
         const newSessionId = randomUUID();
         this.sessions.set(sessionKey, newSessionId);
-        this.fileStore?.set(sessionKey, newSessionId);
+        this.sessionLastUsedAt.set(sessionKey, sessionStartedAt);
+        this.fileStore?.set(sessionKey, newSessionId, sessionStartedAt);
         args.push("--session-id", newSessionId);
       }
 
@@ -381,6 +436,13 @@ export class CliRuntime implements Runtime {
           TELEGRAMABLE_CHAT_ID: message.chatId,
         }
       });
+      this.activeChildren.add(child);
+
+      // Per-execution terminal-emit guard: the timeout path emits an `error`
+      // event then SIGKILLs the child, which fires the `close` handler whose
+      // non-zero branch would emit a second `error`/`complete` for the same
+      // execution. Whichever fires first wins; the other is suppressed.
+      let terminalEmitted = false;
 
       const stdoutChunks: string[] = [];
       const stderrChunks: string[] = [];
@@ -419,14 +481,17 @@ export class CliRuntime implements Runtime {
             receivedAnyOutput,
             stderr: stderrChunks.join("").slice(0, 500)
           });
-          eventBus.emit({
-            executionId,
-            channelId: message.channelId,
-            chatId: message.chatId,
-            type: "error",
-            timestamp: Date.now(),
-            payload: { reason: "Runtime timeout." }
-          });
+          if (!terminalEmitted) {
+            terminalEmitted = true;
+            eventBus.emit({
+              executionId,
+              channelId: message.channelId,
+              chatId: message.chatId,
+              type: "error",
+              timestamp: Date.now(),
+              payload: { reason: "Runtime timeout." }
+            });
+          }
           reject(new Error("Runtime timeout."));
         }, timeoutMs);
       };
@@ -513,6 +578,7 @@ export class CliRuntime implements Runtime {
         clearTimeout(timeout);
         clearInterval(heartbeat);
         cleanupPermissionSub();
+        this.activeChildren.delete(child);
         this.cleanupPendingBlocks(executionId);
         if (mcpFiles) this.cleanupMcpFiles(mcpFiles.mcpDir, mcpFiles.mcpConfigPath, mcpFiles.stateFilePath);
         let reason = error.message;
@@ -522,14 +588,17 @@ export class CliRuntime implements Runtime {
             : `Command not found: "${executable}". Ensure it is installed and available in PATH.`;
         }
         this.logger.error("CLI runtime process error.", { executionId, reason, code: error.code });
-        eventBus.emit({
-          executionId,
-          channelId: message.channelId,
-          chatId: message.chatId,
-          type: "error",
-          timestamp: Date.now(),
-          payload: { reason }
-        });
+        if (!terminalEmitted) {
+          terminalEmitted = true;
+          eventBus.emit({
+            executionId,
+            channelId: message.channelId,
+            chatId: message.chatId,
+            type: "error",
+            timestamp: Date.now(),
+            payload: { reason }
+          });
+        }
         reject(new Error(reason));
       });
 
@@ -537,6 +606,7 @@ export class CliRuntime implements Runtime {
         clearTimeout(timeout);
         clearInterval(heartbeat);
         cleanupPermissionSub();
+        this.activeChildren.delete(child);
 
         // Flush any remaining NDJSON buffer (last line without trailing newline)
         if (this.resolvedOutputFormat === "stream-json" && ndjsonBuffer.trim()) {
@@ -564,14 +634,17 @@ export class CliRuntime implements Runtime {
         if (code === 127) {
           if (mcpFiles) this.cleanupMcpFiles(mcpFiles.mcpDir, mcpFiles.mcpConfigPath, mcpFiles.stateFilePath);
           const reason = `Command not found: "${executable}". Ensure it is installed and available in PATH.`;
-          eventBus.emit({
-            executionId,
-            channelId: message.channelId,
-            chatId: message.chatId,
-            type: "error",
-            timestamp: Date.now(),
-            payload: { reason }
-          });
+          if (!terminalEmitted) {
+            terminalEmitted = true;
+            eventBus.emit({
+              executionId,
+              channelId: message.channelId,
+              chatId: message.chatId,
+              type: "error",
+              timestamp: Date.now(),
+              payload: { reason }
+            });
+          }
           reject(new Error(reason));
           return;
         }
@@ -585,12 +658,26 @@ export class CliRuntime implements Runtime {
           });
           this.sessions.delete(sessionKey);
           this.fileStore?.delete(sessionKey);
+          this.sessionLastUsedAt.delete(sessionKey);
 
           // If this was a resumed session that failed because the conversation
-          // no longer exists, transparently retry with a fresh session.
+          // no longer exists, transparently retry with a fresh session. Emit a
+          // `retry-reset` event first so the hub can drop any hub-side stream
+          // state (streamDrafts, toolActivityMessages) from the failed attempt
+          // before forwarding the retry's events. Without this, a future CLI
+          // change that surfaces partial output before the validation failure
+          // would interleave with the retry's output on Telegram.
           if (existingSessionId && !isRetry && /no conversation found/i.test(stderr)) {
             if (mcpFiles) this.cleanupMcpFiles(mcpFiles.mcpDir, mcpFiles.mcpConfigPath, mcpFiles.stateFilePath);
             this.logger.info("Retrying with fresh session after stale resume ID.", { executionId, staleSessionId: existingSessionId });
+            eventBus.emit({
+              executionId,
+              channelId: message.channelId,
+              chatId: message.chatId,
+              type: "retry-reset",
+              timestamp: Date.now(),
+              payload: { reason: "stale resume" }
+            });
             resolve(this._execute(message, executionId, eventBus, true));
             return;
           }
@@ -614,14 +701,17 @@ export class CliRuntime implements Runtime {
         // Clean up any in-flight block state (in case the CLI exited mid-block)
         this.cleanupPendingBlocks(executionId);
 
-        eventBus.emit({
-          executionId,
-          channelId: message.channelId,
-          chatId: message.chatId,
-          type: "complete",
-          timestamp: Date.now(),
-          payload: { code: code ?? null, response: response || undefined }
-        });
+        if (!terminalEmitted) {
+          terminalEmitted = true;
+          eventBus.emit({
+            executionId,
+            channelId: message.channelId,
+            chatId: message.chatId,
+            type: "complete",
+            timestamp: Date.now(),
+            payload: { code: code ?? null, response: response || undefined }
+          });
+        }
 
         // Clean up MCP files if they were prepared (paused but kept for the
         // async memory worker — #91 reuses this wire-up inside a subprocess).
@@ -920,6 +1010,29 @@ export class CliRuntime implements Runtime {
     // "system" events (api_retry, etc.) are logged but not forwarded.
     if (type === "system") {
       this.logger.info("CLI stream-json system event.", { executionId, subtype: (parsed as Record<string, unknown>).subtype });
+    }
+  }
+
+  /**
+   * Best-effort SIGTERM all active child CLI processes, then SIGKILL after
+   * `graceMs`. Intended for graceful shutdown so we don't orphan zombie
+   * processes when the parent process exits.
+   */
+  async shutdown(graceMs: number = 3_000): Promise<void> {
+    if (this.activeChildren.size === 0) return;
+
+    const children = Array.from(this.activeChildren);
+    for (const child of children) {
+      try { child.kill("SIGTERM"); } catch { /* ignore */ }
+    }
+
+    const deadline = Date.now() + graceMs;
+    while (this.activeChildren.size > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    for (const child of Array.from(this.activeChildren)) {
+      try { child.kill("SIGKILL"); } catch { /* ignore */ }
     }
   }
 

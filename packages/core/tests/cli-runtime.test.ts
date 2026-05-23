@@ -1,5 +1,7 @@
 import assert from "assert";
 import path from "path";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
 import test from "node:test";
 import { CliRuntime } from "../src/runtime/cliRuntime";
 import { EventBus } from "../src/events/eventBus";
@@ -625,4 +627,178 @@ test("CliRuntime tags subagent stream-text with parentToolUseId", async () => {
   const parentText = textEvents.filter((e) => !e.payload?.parentToolUseId);
   assert.ok(parentText.length > 0, "parent text events should not have parentToolUseId");
   assert.equal(parentText[0].payload?.text, "The review found 3 issues.", "parent text content should be correct");
+});
+
+// ---------- Issue 102: executionQueues cleanup ----------
+
+test("CliRuntime.executionQueues clears after settled chains", async () => {
+  const config: AgentConfig = { name: "queue-cleanup", command: "echo" };
+  const runtime = new CliRuntime(config, logger);
+
+  const run = async (chatId: string, execId: string) => {
+    const eb = new EventBus();
+    await runtime.execute(msg({ chatId, text: chatId }), execId, eb);
+  };
+
+  await Promise.all([
+    run("chat-q1", "exec-q1"),
+    run("chat-q2", "exec-q2"),
+    run("chat-q3", "exec-q3"),
+  ]);
+
+  // Wait a tick so the .then() cleanup runs on the microtask queue
+  await new Promise((r) => setImmediate(r));
+
+  // executionQueues is private — assert via Reflect
+  const queues = (runtime as unknown as { executionQueues: Map<string, unknown> }).executionQueues;
+  assert.equal(queues.size, 0, "executionQueues should be empty after all chains settle");
+});
+
+// ---------- Issue 98: idle reset ----------
+
+const withTempCliDir = async (fn: (dir: string) => Promise<void>): Promise<void> => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cli-runtime-test-"));
+  try { await fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+};
+
+test("CliRuntime resets idle session after sessionTimeoutMs (in-process)", async () => {
+  await withTempCliDir(async (dataDir) => {
+    const config: AgentConfig = {
+      name: "idle-agent",
+      command: "echo",
+      sessionTimeoutMs: 50, // 50ms idle threshold
+    };
+    const runtime = new CliRuntime(config, logger, { dataDir });
+
+    // First turn → --session-id (new session created)
+    const eb1 = new EventBus();
+    const ev1 = collect(eb1);
+    await runtime.execute(msg(), "exec-idle-1", eb1);
+    const out1 = ev1.filter((e) => e.type === "stream-text").map((e) => e.payload?.text).join("");
+    assert.ok(out1.includes("--session-id"), "first call should use --session-id");
+
+    // Wait past idle threshold
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Second turn after idle → must use --session-id again (NOT --resume)
+    const eb2 = new EventBus();
+    const ev2 = collect(eb2);
+    await runtime.execute(msg(), "exec-idle-2", eb2);
+    const out2 = ev2.filter((e) => e.type === "stream-text").map((e) => e.payload?.text).join("");
+    assert.ok(out2.includes("--session-id"), "after idle, second call should start fresh with --session-id");
+    assert.ok(!out2.includes("--resume"), "after idle, second call must not --resume the stale session");
+  });
+});
+
+test("CliRuntime resets idle session across simulated process restart via fileStore", async () => {
+  await withTempCliDir(async (dataDir) => {
+    const sessionTimeoutMs = 50;
+    const baseConfig: AgentConfig = {
+      name: "restart-agent",
+      command: "echo",
+      sessionTimeoutMs,
+    };
+
+    // Process 1: create a session, then "stop"
+    const r1 = new CliRuntime(baseConfig, logger, { dataDir });
+    await r1.execute(msg(), "exec-restart-1", new EventBus());
+
+    // Simulate disk-state aging past idle threshold by rewriting the persisted
+    // timestamp to long ago. (Equivalent to a real restart hours later.)
+    const sessionsPath = path.join(dataDir, "cli-sessions.json");
+    const data = JSON.parse(readFileSync(sessionsPath, "utf-8")) as Record<string, { id: string; lastUsedAt: number }>;
+    for (const k of Object.keys(data)) {
+      data[k].lastUsedAt = 0; // far in the past
+    }
+    writeFileSync(sessionsPath, JSON.stringify(data), "utf-8");
+
+    // Process 2: fresh runtime, should see stale persisted entry and reset
+    const r2 = new CliRuntime(baseConfig, logger, { dataDir });
+    const eb = new EventBus();
+    const ev = collect(eb);
+    await r2.execute(msg(), "exec-restart-2", eb);
+    const out = ev.filter((e) => e.type === "stream-text").map((e) => e.payload?.text).join("");
+    assert.ok(out.includes("--session-id"), "fresh process must start a new --session-id after idle");
+    assert.ok(!out.includes("--resume"), "fresh process must not --resume the stale persisted session");
+  });
+});
+
+test("CliRuntime tolerates legacy bare-string entries in cli-sessions.json", async () => {
+  await withTempCliDir(async (dataDir) => {
+    // Pre-write a legacy bare-string file
+    const sessionsPath = path.join(dataDir, "cli-sessions.json");
+    writeFileSync(sessionsPath, JSON.stringify({ "telegram::chat-1": "legacy-session-id" }), "utf-8");
+
+    const config: AgentConfig = { name: "legacy-agent", command: "echo", sessionTimeoutMs: 30 * 60 * 1000 };
+    const runtime = new CliRuntime(config, logger, { dataDir });
+    const eb = new EventBus();
+    const ev = collect(eb);
+    await runtime.execute(msg(), "exec-legacy-1", eb);
+    const out = ev.filter((e) => e.type === "stream-text").map((e) => e.payload?.text).join("");
+    // Legacy entry has lastUsedAt=0, so it's treated as expired → fresh --session-id
+    assert.ok(out.includes("--session-id"), "legacy entry should be treated as expired and trigger fresh --session-id");
+    assert.ok(!out.includes("--resume"), "legacy entry must not be --resume'd");
+  });
+});
+
+test("CliRuntime non-zero exit clears sessionLastUsedAt alongside sessions", async () => {
+  const config: AgentConfig = {
+    name: "fail-clear",
+    command: TEST_CMD,
+    args: ["fail"],
+    sessionTimeoutMs: 30 * 60 * 1000,
+  };
+  const runtime = new CliRuntime(config, logger);
+  const eb = new EventBus();
+  await runtime.execute(msg(), "exec-fail-clear", eb);
+
+  const lastUsedAt = (runtime as unknown as { sessionLastUsedAt: Map<string, number> }).sessionLastUsedAt;
+  assert.equal(lastUsedAt.get("telegram::chat-1"), undefined,
+    "sessionLastUsedAt must be cleared after non-zero exit so a stale stamp can't falsely mark the next turn idle");
+});
+
+// ---------- Issue 100: retry-reset event ----------
+
+test("CliRuntime emits retry-reset before stale-resume retry", async () => {
+  const config: AgentConfig = { name: "retry-reset-agent", command: STALE_SESSION_CMD };
+  const runtime = new CliRuntime(config, logger);
+
+  // First call: establishes a session
+  await runtime.execute(msg(), "exec-rr-1", new EventBus());
+
+  // Second call: will hit the stale-resume retry path
+  const eb = new EventBus();
+  const events = collect(eb);
+  await runtime.execute(msg(), "exec-rr-2", eb);
+
+  const retryReset = events.find((e) => e.type === "retry-reset");
+  assert.ok(retryReset, "should emit retry-reset event before retrying");
+  assert.equal(retryReset?.executionId, "exec-rr-2");
+});
+
+// ---------- Issue 101: timeout double-emit guard ----------
+
+test("CliRuntime timeout emits exactly one of error/complete per execution", async () => {
+  const config: AgentConfig = {
+    name: "double-emit-agent",
+    command: TEST_CMD,
+    args: ["hang"],
+    timeoutMs: 200,
+  };
+  const runtime = new CliRuntime(config, logger);
+  const eb = new EventBus();
+  const events = collect(eb);
+
+  await assert.rejects(
+    () => runtime.execute(msg(), "exec-double-emit", eb),
+    { message: "Runtime timeout." },
+  );
+
+  // Allow the SIGKILL → close handler to run
+  await new Promise((r) => setTimeout(r, 100));
+
+  const terminalEvents = events.filter((e) => e.type === "error" || e.type === "complete");
+  assert.equal(terminalEvents.length, 1, "timeout must emit exactly one terminal event (error OR complete, not both)");
+  assert.equal(terminalEvents[0].type, "error", "the surviving event should be error");
+  assert.equal(terminalEvents[0].payload?.reason, "Runtime timeout.");
 });

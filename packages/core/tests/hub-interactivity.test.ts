@@ -986,3 +986,132 @@ test("formatToolDisplay: tools use friendly display names per the spec map", () 
   assert.ok(out.includes("<b>Agent</b>"), "Task renders as Agent");
   assert.ok(out.includes("<b>Edit</b>"), "MultiEdit renders as Edit");
 });
+
+// ---------- Issue 100: retry-reset clears hub-side stream state ----------
+
+test("ChannelHub.retry-reset clears stream draft and tool activity from prior attempt", async () => {
+  const eventBus = new EventBus();
+  const logger = createLogger("error");
+  const adapter = new MockAdapter("telegram");
+
+  // CLI mock: emits partial stream output + tool-use, fails, then retries with new output.
+  // The final Telegram message must contain only the retry attempt's output.
+  const runtime: Runtime = {
+    async execute(message, executionId, bus): Promise<void> {
+      const base = { executionId, channelId: message.channelId, chatId: message.chatId };
+
+      // First attempt: emits leftover content
+      bus.emit({ ...base, type: "start", timestamp: 1000, payload: { agentName: "claude", messageId: 1 } });
+      bus.emit({ ...base, type: "stream-text", timestamp: 1100, payload: { text: "LEAK_FROM_FIRST_ATTEMPT" } });
+      bus.emit({ ...base, type: "tool-use", timestamp: 1200, payload: { toolName: "Read", toolInput: { file_path: "/leak.ts" }, toolUseId: "tu1" } });
+
+      // Stale-resume retry: emit retry-reset, then the retry's clean output
+      bus.emit({ ...base, type: "retry-reset", timestamp: 1300, payload: { reason: "stale resume" } });
+      bus.emit({ ...base, type: "stream-text", timestamp: 1400, payload: { text: "Clean retry output." } });
+      bus.emit({ ...base, type: "complete", timestamp: 1500, payload: { response: "Clean retry output." } });
+    }
+  };
+
+  const router: Router = { select(message) { return { runtime, message }; } };
+  const hub = new ChannelHub([adapter], router, eventBus, logger);
+  await hub.start();
+
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-retry", text: "hello", messageId: 1 });
+  await sleep(50);
+
+  // After retry-reset, the retry attempt produces its own finalized message
+  // (editMessage on `complete`). That message must contain ONLY the retry
+  // attempt's text — no leakage from the first attempt's accumulated stream.
+  const finalizedEdits = adapter.editedMessages.map((m) => m.text).join("\n");
+  assert.ok(finalizedEdits.includes("Clean retry output."),
+    "retry output should land as a finalized message");
+  assert.ok(!finalizedEdits.includes("LEAK_FROM_FIRST_ATTEMPT"),
+    "the retry's finalized message must not contain text from the first attempt");
+
+  // After complete, both maps should be drained for this executionId. The
+  // retry-reset handler clears them after the failed attempt, and complete
+  // clears anything the retry path created.
+  const streamDrafts = (hub as unknown as { streamDrafts: Map<string, unknown> }).streamDrafts;
+  const toolActivity = (hub as unknown as { toolActivityMessages: Map<string, unknown> }).toolActivityMessages;
+  const residualDraft = Array.from(streamDrafts.keys()).filter((k) => (k as string).includes("chat-retry"));
+  const residualActivity = Array.from(toolActivity.keys()).filter((k) => (k as string).includes("chat-retry"));
+  assert.equal(residualDraft.length, 0, `no residual draft should remain after complete (got: ${residualDraft.join(",")})`);
+  assert.equal(residualActivity.length, 0, `no residual tool-activity should remain after complete (got: ${residualActivity.join(",")})`);
+
+  await hub.stop();
+});
+
+// ---------- Issue 99: graceful shutdown ----------
+
+test("ChannelHub.stop flushes in-flight stream draft to a permanent message", async () => {
+  const eventBus = new EventBus();
+  const logger = createLogger("error");
+  const adapter = new MockAdapter("telegram");
+
+  // No-op runtime — we drive events directly via eventBus for full control.
+  const runtime: Runtime = { async execute(): Promise<void> { /* noop */ } };
+  const router: Router = { select(message) { return { runtime, message }; } };
+  const hub = new ChannelHub([adapter], router, eventBus, logger);
+  await hub.start();
+
+  // Emit start + partial stream-text but no complete — the hub treats this as
+  // an in-flight execution interrupted by SIGTERM.
+  eventBus.emit({
+    executionId: "exec-shut", channelId: "telegram", chatId: "chat-shut",
+    type: "start", timestamp: Date.now(), payload: { agentName: "claude", messageId: 7 }
+  });
+  eventBus.emit({
+    executionId: "exec-shut", channelId: "telegram", chatId: "chat-shut",
+    type: "stream-text", timestamp: Date.now(),
+    payload: { text: "Partial response that must be preserved on SIGTERM." }
+  });
+  await sleep(30);
+
+  // SIGTERM → hub.stop() should flush the draft before clearing maps
+  await hub.stop();
+
+  const allText = [
+    ...adapter.sentMessages.map((m) => m.text),
+    ...adapter.sentMarkupMessages.map((m) => m.text),
+    ...adapter.editedMessages.map((m) => m.text),
+    ...adapter.draftMessages.map((m) => m.text),
+  ].join("\n");
+
+  assert.ok(allText.includes("Partial response that must be preserved on SIGTERM."),
+    "shutdown should preserve in-flight stream text as a permanent Telegram message");
+});
+
+test("ChannelHub.stop clears reactions on in-flight executions", async () => {
+  const eventBus = new EventBus();
+  const logger = createLogger("error");
+  const adapter = new MockAdapter("telegram");
+
+  // Wire up a reaction capture (MockAdapter doesn't ship one by default)
+  const reactions: Array<{ messageId: number; emoji: string | null }> = [];
+  (adapter as unknown as { setMessageReaction: (chatId: string, messageId: number, emoji: string | null) => Promise<void> })
+    .setMessageReaction = async (_chatId, messageId, emoji) => {
+      reactions.push({ messageId, emoji });
+    };
+
+  const runtime: Runtime = { async execute(): Promise<void> { /* noop */ } };
+  const router: Router = { select(message) { return { runtime, message }; } };
+  const hub = new ChannelHub([adapter], router, eventBus, logger);
+  await hub.start();
+
+  // Emit a start event so the hub registers the reactionMessageId and sets 👀
+  eventBus.emit({
+    executionId: "exec-react", channelId: "telegram", chatId: "chat-react",
+    type: "start", timestamp: Date.now(), payload: { agentName: "claude", messageId: 42 }
+  });
+  await sleep(30);
+
+  // SIGTERM
+  await hub.stop();
+
+  // Should have cleared the 👀 reaction (set to null) during shutdown
+  const clearedReactions = reactions.filter((r) => r.emoji === null);
+  assert.ok(clearedReactions.length > 0,
+    "shutdown should clear dangling reactions so they don't remain visible");
+  assert.ok(clearedReactions.some((r) => r.messageId === 42),
+    "the source message reaction must be cleared on shutdown");
+});

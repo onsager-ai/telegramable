@@ -94,17 +94,17 @@ export async function startDaemon(): Promise<void> {
             }
             const cached = cacheStore?.get(rawChatId);
 
-            if (typeof cached === "string" && /^-?\d+$/.test(cached)) {
-              config.memory.chatId = cached;
-              logger.info("Using cached memory chat ID.", { from: rawChatId, to: cached });
-              memoryChannelInfo = { resolvedChatId: cached, rawChatId, cacheSource: "cached", cacheStore };
+            if (cached && /^-?\d+$/.test(cached.id)) {
+              config.memory.chatId = cached.id;
+              logger.info("Using cached memory chat ID.", { from: rawChatId, to: cached.id });
+              memoryChannelInfo = { resolvedChatId: cached.id, rawChatId, cacheSource: "cached", cacheStore };
             } else {
               if (cached != null) {
-                logger.warn("Ignoring invalid cached memory chat ID.", { from: rawChatId, cached });
+                logger.warn("Ignoring invalid cached memory chat ID.", { from: rawChatId, cached: cached.id });
               }
               const chat = await memBot.api.getChat(rawChatId);
               config.memory.chatId = String(chat.id);
-              cacheStore?.set(rawChatId, String(chat.id));
+              cacheStore?.set(rawChatId, String(chat.id), Date.now());
               logger.info("Resolved memory chat.", { from: rawChatId, to: chat.id });
               memoryChannelInfo = { resolvedChatId: String(chat.id), rawChatId, cacheSource: "resolved", cacheStore };
             }
@@ -203,10 +203,22 @@ export async function startDaemon(): Promise<void> {
 
   await hub.start();
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info("Shutting down...");
     refinementScheduler?.stop();
-    await hub.stop();
+    try {
+      await hub.stop();
+    } catch (err) {
+      logger.warn("Hub stop raised during shutdown.", { reason: err instanceof Error ? err.message : "unknown" });
+    }
+    // After the hub has flushed user-visible state, SIGTERM any child CLI
+    // processes spawned by runtimes so we don't leave zombie children.
+    await Promise.allSettled(
+      registry.all().map((runtime) => runtime.shutdown?.(3_000) ?? Promise.resolve()),
+    );
     process.exit(0);
   };
 

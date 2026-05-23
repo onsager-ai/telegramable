@@ -20,6 +20,10 @@ export class AgentRegistry {
     return Array.from(this.runtimes.keys());
   }
 
+  all(): Runtime[] {
+    return Array.from(this.runtimes.values());
+  }
+
   default(): Runtime {
     if (this.defaultAgentName) {
       const runtime = this.runtimes.get(this.defaultAgentName);

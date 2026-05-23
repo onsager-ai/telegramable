@@ -11,7 +11,8 @@ export type ExecutionEventType =
   | "response-end"
   | "tool-use"
   | "thinking"
-  | "turn-complete";
+  | "turn-complete"
+  | "retry-reset";
 
 /** Result of a tool execution, paired to a tool-use by toolUseId. */
 export interface ToolResult {
