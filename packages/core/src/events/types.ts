@@ -12,6 +12,14 @@ export type ExecutionEventType =
   | "thinking"
   | "turn-complete";
 
+/** Result of a tool execution, paired to a tool-use by toolUseId. */
+export interface ToolResult {
+  /** Joined text content of the tool_result block (string content or text parts of an array). */
+  content?: string;
+  /** True if the tool_result block was marked is_error. */
+  isError?: boolean;
+}
+
 export interface ExecutionEvent {
   executionId: string;
   channelId: string;
@@ -31,6 +39,11 @@ export interface ExecutionEvent {
     toolInput?: Record<string, unknown>;
     permissionRequestId?: string;
     decision?: "allow" | "deny";
+
+    /** Anthropic tool_use id (e.g. "toolu_..."). Pairs tool-use to its tool_result. */
+    toolUseId?: string;
+    /** Set on tool-use events that carry the matching tool_result. */
+    toolResult?: ToolResult;
 
     // Streaming fields
     sessionId?: string;

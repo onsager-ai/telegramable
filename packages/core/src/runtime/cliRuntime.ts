@@ -5,6 +5,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { AgentConfig } from "../config";
 import { EventBus } from "../events/eventBus";
+import { ToolResult } from "../events/types";
 import { IMMessage } from "../gateway/types";
 import { Logger } from "../logging";
 import type { MemorySnapshot } from "../memory";
@@ -39,7 +40,7 @@ export class CliRuntime implements Runtime {
   private rootWarningLogged = false;
 
   /** Track in-flight tool blocks to accumulate input from input_json_delta. */
-  private pendingToolBlocks = new Map<string, { name: string; inputJson: string; index: number }>(); // executionId → current block
+  private pendingToolBlocks = new Map<string, { name: string; inputJson: string; index: number; toolUseId?: string }>(); // executionId → current block
 
   /** Track in-flight thinking blocks to accumulate thinking text from thinking_delta. */
   private pendingThinkingBlocks = new Map<string, { index: number; text: string }>(); // executionId → current thinking block
@@ -744,11 +745,13 @@ export class CliRuntime implements Runtime {
         const block = event.content_block as Record<string, unknown> | undefined;
         if (block?.type === "tool_use") {
           const index = typeof event.index === "number" ? event.index : 0;
+          const toolUseId = typeof block.id === "string" ? block.id : undefined;
           // Start accumulating input for this tool block
           this.pendingToolBlocks.set(executionId, {
             name: block.name as string,
             inputJson: "",
             index,
+            toolUseId,
           });
           // Emit immediate tool-use with name only so the hub shows activity right away
           eventBus.emit({
@@ -759,9 +762,28 @@ export class CliRuntime implements Runtime {
             timestamp: Date.now(),
             payload: {
               toolName: block.name as string,
+              toolUseId,
               parentToolUseId,
             }
           });
+        } else if (block?.type === "tool_result") {
+          // Tool result arrives in its own content block. Pair to its tool_use by id.
+          const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
+          if (toolUseId) {
+            const result = extractToolResult(block);
+            eventBus.emit({
+              executionId,
+              channelId: message.channelId,
+              chatId: message.chatId,
+              type: "tool-use",
+              timestamp: Date.now(),
+              payload: {
+                toolUseId,
+                toolResult: result,
+                parentToolUseId,
+              }
+            });
+          }
         } else if (block?.type === "thinking") {
           const index = typeof event.index === "number" ? event.index : 0;
           // Start accumulating thinking text
@@ -831,6 +853,7 @@ export class CliRuntime implements Runtime {
                 payload: {
                   toolName: pendingTool.name,
                   toolInput,
+                  toolUseId: pendingTool.toolUseId,
                   parentToolUseId,
                 }
               });
@@ -859,6 +882,37 @@ export class CliRuntime implements Runtime {
     // via the stream_event path (--include-partial-messages is always set).
     // Emitting again would cause duplicate tool steps in the hub.
     if (type === "assistant") {
+      return;
+    }
+
+    // "user" messages may carry tool_result content blocks. The Anthropic
+    // protocol delivers tool results as user-role messages; emit a tool-use
+    // event with the result attached so the hub can pair it by tool_use_id.
+    if (type === "user") {
+      const userMessage = parsed.message as Record<string, unknown> | undefined;
+      const content = userMessage?.content;
+      const parentToolUseId = (parsed.parent_tool_use_id as string | undefined) || undefined;
+      if (Array.isArray(content)) {
+        for (const block of content as Array<Record<string, unknown>>) {
+          if (block?.type === "tool_result") {
+            const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
+            if (!toolUseId) continue;
+            const result = extractToolResult(block);
+            eventBus.emit({
+              executionId,
+              channelId: message.channelId,
+              chatId: message.chatId,
+              type: "tool-use",
+              timestamp: Date.now(),
+              payload: {
+                toolUseId,
+                toolResult: result,
+                parentToolUseId,
+              }
+            });
+          }
+        }
+      }
       return;
     }
 
@@ -895,4 +949,27 @@ export class CliRuntime implements Runtime {
       });
     }
   }
+}
+
+/**
+ * Pull a flat result payload out of a tool_result content block.
+ * `content` may be a string, or an array of text/image blocks per the
+ * Anthropic protocol — join text parts and drop everything else.
+ */
+function extractToolResult(block: Record<string, unknown>): ToolResult {
+  const isError = block.is_error === true;
+  const raw = block.content;
+  let content: string | undefined;
+  if (typeof raw === "string") {
+    content = raw;
+  } else if (Array.isArray(raw)) {
+    const parts: string[] = [];
+    for (const part of raw as Array<Record<string, unknown>>) {
+      if (part?.type === "text" && typeof part.text === "string") {
+        parts.push(part.text);
+      }
+    }
+    if (parts.length > 0) content = parts.join("\n");
+  }
+  return { content, isError };
 }
