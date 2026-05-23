@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from "fs";
 import { basename, join } from "path";
 import { tmpdir } from "os";
 import { EventBus } from "../events/eventBus";
-import { ExecutionEvent } from "../events/types";
+import { ExecutionEvent, ToolResult } from "../events/types";
 import { IMAdapter, IMAdapterStartOptions, IMMessage } from "../gateway/types";
 import { Logger } from "../logging";
 import { formatMemoryList } from "../memory";
@@ -28,9 +28,6 @@ import { Router } from "./router";
 import { SudoWatcher } from "./sudoWatcher";
 
 const TELEGRAM_MSG_LIMIT = 4000;
-
-/** Max chars for a bash command rendered in a <pre><code> block. */
-const BASH_BLOCK_LIMIT = 400;
 
 const truncate = (text: string, max: number): string => {
   if (text.length <= max) {
@@ -175,52 +172,73 @@ const formatDuration = (ms: number): string => {
   return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
 };
 
-/** Format a human-readable tool activity description (like Claude Code mobile). */
-const formatToolDescription = (toolName: string, toolInput?: Record<string, unknown>): string => {
-  // Thinking has no toolInput but needs a custom label
-  if (toolName.toLowerCase() === "thinking") return "<i>Thinking</i>";
-  if (!toolInput) return `<b>${escapeHtml(toolName)}</b>`;
+/**
+ * Resolve the display name and primary argument for a tool, per the unified
+ * step template `<b>{name}</b> <code>{arg}</code>`. Pulls the salient input
+ * (file basename / command / pattern / agent description) and maps the tool
+ * to a friendly display name — Grep → Search, Task → Agent, etc.
+ *
+ * `name` is plain (not HTML-escaped); `arg` is plain text suitable for
+ * wrapping in `<code>`. Callers escape on output.
+ */
+const formatToolDisplay = (
+  toolName: string,
+  toolInput?: Record<string, unknown>,
+): { name: string; arg?: string } => {
+  const lower = toolName.toLowerCase();
 
-  const short = (val: unknown, max = 40): string => {
-    const str = typeof val === "string" ? val : JSON.stringify(val);
-    return escapeHtml(truncate(str, max));
+  const fileBasename = (val: unknown): string | undefined => {
+    if (typeof val !== "string" || val.length === 0) return undefined;
+    return basename(val);
   };
 
-  // Extract a meaningful detail from the tool input based on common patterns
-  const filePath = toolInput.file_path ?? toolInput.path ?? toolInput.filePath;
-  const command = toolInput.command;
-  const pattern = toolInput.pattern ?? toolInput.query ?? toolInput.regex;
-  const prompt = toolInput.prompt ?? toolInput.description ?? toolInput.message;
+  const asString = (val: unknown): string | undefined =>
+    typeof val === "string" && val.length > 0 ? val : undefined;
 
-  switch (toolName.toLowerCase()) {
+  const input = toolInput ?? {};
+  const filePath = input.file_path ?? input.path ?? input.filePath;
+  const command = input.command;
+  const pattern = input.pattern ?? input.query ?? input.regex;
+  const description = input.description;
+  const prompt = input.prompt;
+
+  switch (lower) {
     case "read":
-      return filePath ? `Reading <code>${short(filePath)}</code>` : "<b>Read</b>";
+      return { name: "Read", arg: fileBasename(filePath) };
     case "write":
-      return filePath ? `Writing <code>${short(filePath)}</code>` : "<b>Write</b>";
+      return { name: "Write", arg: fileBasename(filePath) };
     case "edit":
-      return filePath ? `Editing <code>${short(filePath)}</code>` : "<b>Edit</b>";
-    case "glob":
-      return pattern ? `Finding files <code>${short(pattern)}</code>` : "Finding files";
+    case "multiedit":
+      return { name: "Edit", arg: fileBasename(filePath) };
+    case "bash":
+      return { name: "Bash", arg: asString(command) };
     case "grep":
-      return pattern ? `Searching for <code>${short(pattern)}</code>` : "Searching code";
-    case "bash": {
-      if (typeof command !== "string" || command.length === 0) return "Running command";
-      // Always render in a <pre><code> block so the full command stays visible
-      // and tap-to-copyable, both during the live timeline and in the final
-      // post-completion summary.
-      const block = escapeHtml(truncate(command, BASH_BLOCK_LIMIT));
-      return `Running\n<pre><code class="language-bash">${block}</code></pre>`;
+      return { name: "Search", arg: asString(pattern) };
+    case "glob":
+      return { name: "Glob", arg: asString(pattern) };
+    case "task":
+    case "agent": {
+      const arg = asString(description) ?? (asString(prompt) ? truncate(prompt as string, 40) : undefined);
+      return { name: "Agent", arg };
     }
-    case "agent":
-      return prompt ? `Agent: ${short(prompt, 50)}` : "Running sub-agent";
     default: {
-      // For unknown tools, show the tool name with the first string input value
-      const firstVal = Object.values(toolInput).find((v) => typeof v === "string");
-      return firstVal
-        ? `<b>${escapeHtml(toolName)}</b> <code>${short(firstVal)}</code>`
-        : `<b>${escapeHtml(toolName)}</b>`;
+      // Unknown / MCP tools: keep the tool name as-is, use the first string-valued input
+      const firstVal = Object.values(input).find((v) => typeof v === "string" && v.length > 0);
+      return { name: toolName, arg: asString(firstVal) };
     }
   }
+};
+
+/**
+ * Render a single step's body (without the `✓/▸/✗` prefix) per the unified
+ * template `<b>{name}</b> <code>{arg}</code>`. Used by both the running-state
+ * `▸` cue and the completed/error blockquote rows.
+ */
+const formatToolDescription = (toolName: string, toolInput?: Record<string, unknown>): string => {
+  const { name, arg } = formatToolDisplay(toolName, toolInput);
+  const nameHtml = `<b>${escapeHtml(name)}</b>`;
+  if (!arg) return nameHtml;
+  return `${nameHtml} <code>${escapeHtml(arg)}</code>`;
 };
 
 /** Format a tool permission request as an HTML message for Telegram. */
@@ -237,17 +255,16 @@ const formatPermissionRequest = (toolName: string, toolInput: Record<string, unk
 
 type ToolCategory = "read" | "edit" | "bash" | "search" | "agent" | "thinking" | "other";
 
-const CATEGORY_EMOJI: Record<ToolCategory, string> = {
+const CATEGORY_EMOJI: Record<Exclude<ToolCategory, "thinking">, string> = {
   read: "📖",
   edit: "✏️",
   bash: "⚡",
   search: "🔍",
   agent: "🤖",
-  thinking: "💭",
   other: "⚙️",
 };
 
-const CATEGORY_ORDER: ToolCategory[] = ["read", "edit", "bash", "search", "agent", "thinking", "other"];
+const CATEGORY_ORDER: Array<Exclude<ToolCategory, "thinking">> = ["read", "edit", "bash", "search", "agent", "other"];
 
 export const categorizeToolName = (toolName: string): ToolCategory => {
   const lower = toolName.toLowerCase();
@@ -274,9 +291,10 @@ export const categorizeToolName = (toolName: string): ToolCategory => {
 };
 
 const formatCategoryCounters = (tools: ReadonlyArray<{ name: string }>): string => {
-  const counts = new Map<ToolCategory, number>();
+  const counts = new Map<Exclude<ToolCategory, "thinking">, number>();
   for (const t of tools) {
     const cat = categorizeToolName(t.name);
+    if (cat === "thinking") continue; // filtered upstream, defense-in-depth here
     counts.set(cat, (counts.get(cat) ?? 0) + 1);
   }
   const parts: string[] = [];
@@ -287,12 +305,106 @@ const formatCategoryCounters = (tools: ReadonlyArray<{ name: string }>): string 
   return parts.join(" ");
 };
 
+/**
+ * Build a single-line plain-text suffix summarizing the result of a tool call,
+ * to be appended to the step row inside the Done-state blockquote. Returns
+ * `undefined` when there is nothing useful to say (missing result, unknown tool).
+ *
+ * The suffix is plain text by design — no `<code>`, no `<pre>` — so it can't
+ * spawn an independent Telegram widget that breaks the blockquote's collapse.
+ */
+export const formatToolResultSuffix = (
+  toolName: string,
+  result: ToolResult | undefined,
+): string | undefined => {
+  if (!result) return undefined;
+  const category = categorizeToolName(toolName);
+
+  // Bash failure dominates — surface it regardless of content shape
+  if (category === "bash" && result.isError) return "(failed)";
+
+  const content = result.content ?? "";
+
+  switch (category) {
+    case "bash": {
+      const lines = countNonEmptyLines(content);
+      return `(${lines} line${lines === 1 ? "" : "s"})`;
+    }
+    case "read": {
+      const lines = countNonEmptyLines(content);
+      return `(${lines} line${lines === 1 ? "" : "s"})`;
+    }
+    case "edit": {
+      // Try to parse "+N -M" style diff stats; fall back to (updated)
+      const stats = parseDiffStats(content);
+      if (stats) return `(-${stats.removed} +${stats.added})`;
+      return "(updated)";
+    }
+    case "search": {
+      const lower = toolName.toLowerCase();
+      if (lower === "glob") {
+        const files = countNonEmptyLines(content);
+        return files === 0 ? "(no files)" : `(${files} file${files === 1 ? "" : "s"})`;
+      }
+      // Grep
+      const matches = countNonEmptyLines(content);
+      return matches === 0 ? "(no matches)" : `(${matches} ${matches === 1 ? "match" : "matches"})`;
+    }
+    case "agent": {
+      const firstLine = content.split("\n").map((l) => l.trim()).find((l) => l.length > 0);
+      if (!firstLine) return undefined;
+      return `("${truncate(firstLine, 40)}")`;
+    }
+    default:
+      return undefined;
+  }
+};
+
+const countNonEmptyLines = (text: string): number => {
+  if (!text) return 0;
+  let count = 0;
+  for (const line of text.split("\n")) {
+    if (line.trim().length > 0) count++;
+  }
+  return count;
+};
+
+/**
+ * Extract `+N -M` style diff stats from an Edit/MultiEdit tool result.
+ * Handles common Claude Code confirmation patterns like
+ * "Applied 1 edit to file.ts: +12 -3" or "5 additions / 2 deletions".
+ * Returns `undefined` if no recognizable pattern is found.
+ */
+const parseDiffStats = (text: string): { added: number; removed: number } | undefined => {
+  if (!text) return undefined;
+  // "+12 -3", "+12/-3"
+  const plusFirst = text.match(/\+(\d+)[^\d+-]+-(\d+)/);
+  if (plusFirst) return { added: parseInt(plusFirst[1], 10), removed: parseInt(plusFirst[2], 10) };
+  // "-3 +12", "-3/+12"
+  const minusFirst = text.match(/-(\d+)[^\d+-]+\+(\d+)/);
+  if (minusFirst) return { added: parseInt(minusFirst[2], 10), removed: parseInt(minusFirst[1], 10) };
+  // "12 additions, 3 deletions"
+  const verbose = text.match(/(\d+)\s+addition[s]?[,\s/]+\s*(\d+)\s+deletion[s]?/i);
+  if (verbose) return { added: parseInt(verbose[1], 10), removed: parseInt(verbose[2], 10) };
+  return undefined;
+};
+
 /** Max number of (deduplicated) entries shown inside the expandable blockquote. */
 const TOOL_ACTIVITY_BLOCKQUOTE_MAX = 150;
 
+export interface ActivityTool {
+  name: string;
+  input?: Record<string, unknown>;
+  isSubagent?: boolean;
+  /** Anthropic tool_use id — used to pair with tool_result. */
+  toolUseId?: string;
+  /** Populated once the matching tool_result arrives. */
+  result?: ToolResult;
+}
+
 interface RenderActivityState {
   status: "running" | "complete" | "error";
-  tools: ReadonlyArray<{ name: string; input?: Record<string, unknown>; isSubagent?: boolean }>;
+  tools: ReadonlyArray<ActivityTool>;
   executionId: string;
   durationMs?: number;
   errorReason?: string;
@@ -301,18 +413,28 @@ interface RenderActivityState {
 /**
  * Render a tool-activity status message for Telegram.
  *
- * Output:
- *   {icon} {label}[ · N steps][ · {duration}]
- *   {counters}[ · ▸ {current}]
- *   [<i>{error reason}</i>]
- *   <blockquote expandable>{full deduped step list}</blockquote>
+ * Completed:
+ *   ✅ <b>Done</b> · <i>3 steps · 10s</i>
+ *   ⚡1 📖1 ✏️1
+ *   <blockquote expandable>
+ *   ✓ <b>Read</b> <code>hub.ts</code> (1790 lines)
+ *   …
+ *   </blockquote>
  *
- * The blockquote is collapsed by default once its content exceeds ~3 lines.
- * Contents are truncated at TOOL_ACTIVITY_BLOCKQUOTE_MAX deduped entries to
- * stay safely under Telegram's 4096-char body cap.
+ * Running (no blockquote — keeps edit payloads short and avoids Telegram's
+ * "blockquote does not collapse under ~4 lines" footgun):
+ *   ⚙️ <b>Working</b> · <i>3 steps</i>
+ *   ⚡1 📖1 · ▸ <b>Edit</b> <code>hub.ts</code>
+ *
+ * Error: like Done, plus `<i>{reason}</i>` between counter and blockquote;
+ * the failing (last) step row is prefixed `✗` instead of `✓`.
+ *
+ * Thinking steps are filtered out before any counting happens — they don't
+ * contribute to the step total, the counter, or the blockquote.
  */
 export const renderActivity = (state: RenderActivityState): string => {
-  const total = state.tools.length;
+  const visibleTools = state.tools.filter((t) => categorizeToolName(t.name) !== "thinking");
+  const total = visibleTools.length;
 
   // Header line: icon + label + optional steps/duration
   const icon = state.status === "complete" ? "✅" : state.status === "error" ? "❌" : "⚙️";
@@ -327,9 +449,9 @@ export const renderActivity = (state: RenderActivityState): string => {
 
   // Counter line + (running only) ▸ current
   if (total > 0) {
-    const counters = formatCategoryCounters(state.tools);
+    const counters = formatCategoryCounters(visibleTools);
     if (state.status === "running") {
-      const lastTool = state.tools[state.tools.length - 1];
+      const lastTool = visibleTools[visibleTools.length - 1];
       const currentDesc = formatToolDescription(lastTool.name, lastTool.input);
       lines.push(`${counters} · ▸ ${currentDesc}`);
     } else {
@@ -342,23 +464,51 @@ export const renderActivity = (state: RenderActivityState): string => {
     lines.push(`<i>${escapeHtml(state.errorReason)}</i>`);
   }
 
-  // Dedup-consecutive step list inside an expandable blockquote
+  // Running state: skip blockquote entirely. The `▸ current` cue on the
+  // counter line already covers "what's happening now"; past steps will
+  // appear in the Done summary once the run finishes.
+  if (state.status === "running") {
+    return lines.join("\n");
+  }
+
+  // Dedup-consecutive step list inside an expandable blockquote.
+  // Each row carries: prefix (✓ / ✗), the unified body, optional suffix
+  // describing the tool's result.
   if (total > 0) {
-    const deduped: Array<{ desc: string; count: number; isSubagent?: boolean }> = [];
-    for (const tool of state.tools) {
+    type Row = { body: string; count: number; isSubagent?: boolean; prefix: string };
+    const deduped: Row[] = [];
+
+    for (let i = 0; i < visibleTools.length; i++) {
+      const tool = visibleTools[i];
       const desc = formatToolDescription(tool.name, tool.input);
+      const suffix = formatToolResultSuffix(tool.name, tool.result);
+      const bashFailed =
+        categorizeToolName(tool.name) === "bash" && tool.result?.isError === true;
+      const isLast = i === visibleTools.length - 1;
+      // ✗ for the failing step (the last step of an Error-state run, or any
+      // bash step whose result reported an error). Everything else is ✓.
+      const isFailing = (state.status === "error" && isLast) || bashFailed;
+      const prefix = isFailing ? "✗" : "✓";
+      const body = suffix ? `${desc} ${escapeHtml(suffix)}` : desc;
+
       const last = deduped[deduped.length - 1];
-      if (last && last.desc === desc && last.isSubagent === tool.isSubagent) {
+      if (
+        last &&
+        last.body === body &&
+        last.isSubagent === tool.isSubagent &&
+        last.prefix === prefix
+      ) {
         last.count++;
       } else {
-        deduped.push({ desc, count: 1, isSubagent: tool.isSubagent });
+        deduped.push({ body, count: 1, isSubagent: tool.isSubagent, prefix });
       }
     }
 
     const visible = deduped.slice(0, TOOL_ACTIVITY_BLOCKQUOTE_MAX);
     const blockquoteLines = visible.map((entry) => {
-      const prefix = entry.isSubagent ? "↳ " : "";
-      return entry.count > 1 ? `${prefix}${entry.desc} <i>x${entry.count}</i>` : `${prefix}${entry.desc}`;
+      const sub = entry.isSubagent ? "↳ " : "";
+      const row = `${entry.prefix} ${sub}${entry.body}`;
+      return entry.count > 1 ? `${row} <i>x${entry.count}</i>` : row;
     });
     if (deduped.length > TOOL_ACTIVITY_BLOCKQUOTE_MAX) {
       const more = deduped.length - TOOL_ACTIVITY_BLOCKQUOTE_MAX;
@@ -391,7 +541,7 @@ export class ChannelHub {
   private readonly completionPending = new Set<string>(); // executionIds whose complete/error event is already queued — used to short-circuit pending stream-text sends
   private draftIdCounter = 0; // monotonic counter for Telegram draft IDs
   private readonly typingIntervals = new Map<string, ReturnType<typeof setInterval>>(); // periodic typing indicators
-  private readonly toolActivityMessages = new Map<string, { executionId: string; tools: Array<{ name: string; input?: Record<string, unknown>; isSubagent?: boolean }>; messageId?: number; promotionTimer?: ReturnType<typeof setTimeout>; promoted: boolean; sendingPromise?: Promise<void> }>(); // tool activity tracking
+  private readonly toolActivityMessages = new Map<string, { executionId: string; tools: ActivityTool[]; messageId?: number; promotionTimer?: ReturnType<typeof setTimeout>; promoted: boolean; sendingPromise?: Promise<void> }>(); // tool activity tracking
   private readonly eventQueues = new Map<string, Promise<void>>(); // serialize events per execution
   private readonly reactionMessageIds = new Map<string, number>(); // executionId → source messageId for clearing reactions
   private readonly downloadedFiles = new Map<string, string[]>(); // executionId → local file paths to clean up
@@ -928,13 +1078,25 @@ export class ChannelHub {
         this.executionRegistry.append(event.executionId, `${label} ${text}`);
         break;
       }
-      case "tool-use":
-        this.executionRegistry.trackToolUse(
-          event.executionId,
-          event.payload?.toolName || "unknown",
-          event.payload?.toolInput
-        );
+      case "tool-use": {
+        const payload = event.payload || {};
+        // tool_result events ride the same event type — pair by toolUseId.
+        if (payload.toolResult && payload.toolUseId) {
+          this.executionRegistry.trackToolResult(
+            event.executionId,
+            payload.toolUseId,
+            payload.toolResult,
+          );
+        } else {
+          this.executionRegistry.trackToolUse(
+            event.executionId,
+            payload.toolName || "unknown",
+            payload.toolInput,
+            payload.toolUseId,
+          );
+        }
         break;
+      }
       case "complete":
         this.executionRegistry.complete(event.executionId, event.timestamp);
         break;
@@ -1237,9 +1399,12 @@ export class ChannelHub {
   private static readonly TOOL_ACTIVITY_PROMOTION_MS = 1_500;
 
   private async forwardToolActivity(adapter: IMAdapter, event: ExecutionEvent, topicId?: number): Promise<void> {
-    const toolName = event.payload?.toolName || "unknown";
-    const toolInput = event.payload?.toolInput;
-    const isSubagent = !!event.payload?.parentToolUseId;
+    const payload = event.payload || {};
+    const toolName = payload.toolName || "unknown";
+    const toolInput = payload.toolInput;
+    const toolUseId = payload.toolUseId;
+    const toolResult = payload.toolResult;
+    const isSubagent = !!payload.parentToolUseId;
     const activityKey = `${event.channelId}:${event.chatId}:${event.executionId}`;
 
     let activity = this.toolActivityMessages.get(activityKey);
@@ -1248,13 +1413,24 @@ export class ChannelHub {
       this.toolActivityMessages.set(activityKey, activity);
     }
 
+    // tool_result rides the same event — pair it onto the matching tool entry
+    // by toolUseId and skip the rest of the bookkeeping. There's nothing new
+    // for the user to see between the running-state cue and the Done summary,
+    // but the result is now attached for finalize-time rendering.
+    if (toolResult && toolUseId) {
+      const target = activity.tools.find((t) => t.toolUseId === toolUseId);
+      if (target) target.result = toolResult;
+      return;
+    }
+
     // If the last tool has the same name and no input yet, this is an enriched
     // update (input arrived via input_json_delta) — update in-place instead of duplicating.
     const lastTool = activity.tools[activity.tools.length - 1];
     if (lastTool && lastTool.name === toolName && !lastTool.input && toolInput && Object.keys(toolInput).length > 0) {
       lastTool.input = toolInput;
+      if (toolUseId && !lastTool.toolUseId) lastTool.toolUseId = toolUseId;
     } else {
-      activity.tools.push({ name: toolName, input: toolInput, isSubagent });
+      activity.tools.push({ name: toolName, input: toolInput, isSubagent, toolUseId });
     }
 
     if (activity.promoted) {
@@ -1280,7 +1456,7 @@ export class ChannelHub {
     // Otherwise: timer already running, tools are being accumulated — nothing to do yet
   }
 
-  private async sendOrEditToolActivity(adapter: IMAdapter, chatId: string, activity: { executionId: string; tools: Array<{ name: string; input?: Record<string, unknown>; isSubagent?: boolean }>; messageId?: number; promoted: boolean }, topicId?: number): Promise<void> {
+  private async sendOrEditToolActivity(adapter: IMAdapter, chatId: string, activity: { executionId: string; tools: ActivityTool[]; messageId?: number; promoted: boolean }, topicId?: number): Promise<void> {
     const record = this.executionRegistry.get(activity.executionId);
     const durationMs = record ? Date.now() - record.startedAt : undefined;
     const statusMsg = renderActivity({

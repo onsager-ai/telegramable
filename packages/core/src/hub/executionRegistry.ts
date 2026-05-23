@@ -1,9 +1,14 @@
+import { ToolResult } from "../events/types";
 import { stripAnsi } from "../runtime/session/utils";
 
 export interface ToolUseRecord {
   name: string;
   input?: Record<string, unknown>;
   timestamp: number;
+  /** Anthropic tool_use id ("toolu_..."), used to pair this record with its tool_result. */
+  toolUseId?: string;
+  /** Result of the tool execution, populated when the matching tool_result arrives. */
+  result?: ToolResult;
 }
 
 export interface ExecutionRecord {
@@ -29,7 +34,13 @@ export interface ExecutionRegistry {
     startedAt: number;
   }): void;
   append(executionId: string, text: string): void;
-  trackToolUse(executionId: string, name: string, input?: Record<string, unknown>): void;
+  trackToolUse(
+    executionId: string,
+    name: string,
+    input?: Record<string, unknown>,
+    toolUseId?: string,
+  ): void;
+  trackToolResult(executionId: string, toolUseId: string, result: ToolResult): void;
   complete(executionId: string, finishedAt: number): void;
   error(executionId: string, reason: string, finishedAt: number): void;
   get(executionId: string): ExecutionRecord | undefined;
@@ -99,20 +110,56 @@ export class InMemoryExecutionRegistry implements ExecutionRegistry {
     }
   }
 
-  trackToolUse(executionId: string, name: string, input?: Record<string, unknown>): void {
+  trackToolUse(
+    executionId: string,
+    name: string,
+    input?: Record<string, unknown>,
+    toolUseId?: string,
+  ): void {
     const record = this.records.get(executionId);
     if (!record) {
       return;
     }
+
+    // If this is an enriched update for a tool-use that was already recorded
+    // by toolUseId (input arrived after the initial name-only event), update
+    // the existing record in-place rather than duplicating.
+    if (toolUseId) {
+      const existing = record.toolUses.find((t) => t.toolUseId === toolUseId);
+      if (existing) {
+        if (input && Object.keys(input).length > 0 && !existing.input) {
+          existing.input = { ...input };
+        }
+        return;
+      }
+    }
+
     record.toolUses.push({
       name,
       input: input ? { ...input } : undefined,
-      timestamp: this.now()
+      timestamp: this.now(),
+      toolUseId,
     });
 
     if (record.toolUses.length > this.maxLines) {
       record.toolUses.splice(0, record.toolUses.length - this.maxLines);
     }
+  }
+
+  trackToolResult(executionId: string, toolUseId: string, result: ToolResult): void {
+    const record = this.records.get(executionId);
+    if (!record) {
+      return;
+    }
+    // Pair to the existing tool_use by id. Walk from the end since results
+    // usually arrive near the tool-use they belong to.
+    for (let i = record.toolUses.length - 1; i >= 0; i--) {
+      if (record.toolUses[i].toolUseId === toolUseId) {
+        record.toolUses[i].result = result;
+        return;
+      }
+    }
+    // No matching tool_use — silently drop. Result without a use is unrenderable.
   }
 
   complete(executionId: string, finishedAt: number): void {

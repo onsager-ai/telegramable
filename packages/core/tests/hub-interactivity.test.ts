@@ -5,7 +5,7 @@ import type { AddressInfo } from "net";
 import { existsSync, readFileSync } from "fs";
 import { EventBus } from "../src/events/eventBus";
 import { createLogger } from "../src/logging";
-import { ChannelHub, categorizeToolName, parseBuiltinCommand, renderActivity } from "../src/hub/hub";
+import { ChannelHub, categorizeToolName, formatToolResultSuffix, parseBuiltinCommand, renderActivity } from "../src/hub/hub";
 import { Router } from "../src/hub/router";
 import { Runtime } from "../src/runtime/types";
 import { MockAdapter } from "./mockAdapter";
@@ -644,6 +644,70 @@ test("ChannelHub sends file-only message to runtime when no caption", async () =
   await hub.stop();
 });
 
+test("ChannelHub pairs tool_use → tool_result by toolUseId and renders suffixes in Done summary", async () => {
+  const eventBus = new EventBus();
+  const logger = createLogger("error");
+  const adapter = new MockAdapter("telegram");
+
+  const runtime: Runtime = {
+    async execute(message, executionId, bus): Promise<void> {
+      const base = { executionId, channelId: message.channelId, chatId: message.chatId };
+
+      bus.emit({ ...base, type: "start", timestamp: 1000, payload: { agentName: "claude" } });
+
+      // tool_use Read
+      bus.emit({
+        ...base,
+        type: "tool-use",
+        timestamp: 1500,
+        payload: { toolName: "Read", toolInput: { file_path: "/a.ts" }, toolUseId: "toolu_read_1" }
+      });
+      // matching tool_result for Read
+      bus.emit({
+        ...base,
+        type: "tool-use",
+        timestamp: 1600,
+        payload: { toolUseId: "toolu_read_1", toolResult: { content: "l1\nl2\nl3\n" } }
+      });
+
+      // tool_use Bash (failed)
+      bus.emit({
+        ...base,
+        type: "tool-use",
+        timestamp: 1700,
+        payload: { toolName: "Bash", toolInput: { command: "git push" }, toolUseId: "toolu_bash_1" }
+      });
+      bus.emit({
+        ...base,
+        type: "tool-use",
+        timestamp: 1800,
+        payload: { toolUseId: "toolu_bash_1", toolResult: { content: "denied", isError: true } }
+      });
+
+      // Wait past promotion timer so the activity message gets sent
+      await sleep(1600);
+
+      bus.emit({ ...base, type: "complete", timestamp: 8000, payload: { response: "done" } });
+    }
+  };
+
+  const router: Router = { select(message) { return { runtime, message }; } };
+  const hub = new ChannelHub([adapter], router, eventBus, logger);
+  await hub.start();
+
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "do work" });
+  await sleep(2000);
+
+  // The activity message should have been edited into the Done summary carrying
+  // both result suffixes and the ✗ upgrade on the failed bash step.
+  const summary = adapter.editedMessages.find((m) => m.text.includes("✅ <b>Done</b>"));
+  assert.ok(summary, "should produce a Done summary");
+  assert.ok(summary!.text.includes("✓ <b>Read</b> <code>a.ts</code> (3 lines)"), "Read step has (N lines) suffix");
+  assert.ok(summary!.text.includes("✗ <b>Bash</b> <code>git push</code> (failed)"), "failed bash uses ✗ and (failed) suffix");
+
+  await hub.stop();
+});
+
 // ---------- renderActivity / categorizeToolName (#88) ----------
 
 test("categorizeToolName maps tool names to categories case-insensitively", () => {
@@ -669,7 +733,7 @@ test("renderActivity: empty tools produces header only", () => {
   assert.ok(!out.includes("·"), "no extras (steps/duration) when empty and no duration");
 });
 
-test("renderActivity: single running tool shows step count, current cue, and blockquote", () => {
+test("renderActivity: single running tool shows step count and current cue but no blockquote", () => {
   const out = renderActivity({
     status: "running",
     tools: [{ name: "Read", input: { file_path: "/tmp/a.ts" } }],
@@ -679,11 +743,13 @@ test("renderActivity: single running tool shows step count, current cue, and blo
   assert.ok(out.includes("1 step"), "1 step in header");
   assert.ok(out.includes("📖1"), "counter line with read=1");
   assert.ok(out.includes("· ▸"), "current tool cue while running");
-  assert.ok(out.includes("<blockquote expandable>"), "blockquote present");
-  assert.ok(out.includes("Reading"), "step rendered inside blockquote");
+  assert.ok(out.includes("<b>Read</b>"), "tool display name");
+  assert.ok(out.includes("<code>a.ts</code>"), "primary arg is basename in code");
+  assert.ok(!out.includes("<blockquote"), "running state skips blockquote to keep edits short");
+  assert.ok(!out.includes("Reading"), "no verb-based descriptor in unified template");
 });
 
-test("renderActivity: single done tool drops current cue and shows duration", () => {
+test("renderActivity: single done tool drops current cue, shows duration, and renders ✓-prefixed step", () => {
   const out = renderActivity({
     status: "complete",
     tools: [{ name: "Read", input: { file_path: "/a.ts" } }],
@@ -694,6 +760,9 @@ test("renderActivity: single done tool drops current cue and shows duration", ()
   assert.ok(out.includes("1 step"), "step count");
   assert.ok(out.includes("8s"), "duration in header");
   assert.ok(!out.includes("▸"), "no current cue when done");
+  assert.ok(out.includes("<blockquote expandable>"), "blockquote present in completed state");
+  assert.ok(out.includes("✓ <b>Read</b>"), "completed step uses ✓ prefix with unified template");
+  assert.ok(!out.includes("<pre>"), "no <pre> blocks defeating blockquote collapse");
 });
 
 test("renderActivity: many running tools include each category in counter line", () => {
@@ -731,9 +800,11 @@ test("renderActivity: many done tools dedup consecutive identical entries with x
   });
   assert.ok(out.includes("x3"), "consecutive identical entries collapsed with count");
   assert.ok(out.includes("4 steps"), "step header reflects raw count, not deduped count");
+  assert.ok(out.includes("✓ <b>Bash</b> <code>ls</code>"), "bash step renders inline, not in <pre>");
+  assert.ok(!out.includes("<pre>"), "no <pre> blocks anywhere");
 });
 
-test("renderActivity: error with reason renders icon, reason between counters and blockquote", () => {
+test("renderActivity: error with reason renders icon, reason between counters and blockquote, ✗-prefixed failing step", () => {
   const out = renderActivity({
     status: "error",
     tools: [{ name: "Bash", input: { command: "rm -rf /" } }],
@@ -743,6 +814,7 @@ test("renderActivity: error with reason renders icon, reason between counters an
   });
   assert.ok(out.includes("❌ <b>Error</b>"), "error header");
   assert.ok(out.includes("Runtime timeout."), "reason included");
+  assert.ok(out.includes("✗ <b>Bash</b>"), "failing step uses ✗ prefix");
   const reasonIdx = out.indexOf("Runtime timeout.");
   const counterIdx = out.indexOf("⚡1");
   const blockquoteIdx = out.indexOf("<blockquote");
@@ -750,19 +822,167 @@ test("renderActivity: error with reason renders icon, reason between counters an
   assert.ok(reasonIdx < blockquoteIdx, "reason before blockquote");
 });
 
-test("renderActivity: 200-step run truncates blockquote contents with /logs hint", () => {
-  // Each step has unique input so dedup doesn't collapse them.  The 150-entry
+test("renderActivity: 200-step done run truncates blockquote contents with /logs hint", () => {
+  // Each step has unique input so dedup doesn't collapse them. The 150-entry
   // threshold was chosen for simplicity (over a dynamic byte-budget); for
   // typical reads/edits/searches that stays well under Telegram's 4096-char
-  // cap.  Adversarial inputs with very long descriptions can still exceed it
+  // cap. Adversarial inputs with very long descriptions can still exceed it
   // — Telegram rejects the edit in that case and the previous "Working"
   // status remains visible, which is an acceptable graceful failure mode.
+  //
+  // Note: running-state activities skip the blockquote entirely; the
+  // truncation hint only applies once the run completes.
   const tools = Array.from({ length: 200 }, (_, i) => ({
     name: "Read",
     input: { file_path: `/f${i}.ts` },
   }));
-  const out = renderActivity({ status: "running", tools, executionId: "exec-200" });
+  const out = renderActivity({ status: "complete", tools, executionId: "exec-200", durationMs: 30_000 });
   assert.ok(out.includes("200 steps"), "step header shows total");
   assert.ok(out.includes("📖200"), "counter reflects raw total, not truncated");
   assert.ok(out.includes("(50 more, /logs exec-200 for full)"), "truncation hint with executionId");
+});
+
+test("renderActivity: thinking tools are filtered out of total, counter, and blockquote", () => {
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Read", input: { file_path: "/a.ts" } },
+      { name: "Thinking" },
+      { name: "Thinking" },
+      { name: "Bash", input: { command: "ls" } },
+    ],
+    executionId: "x-thinking",
+    durationMs: 5_000,
+  });
+  assert.ok(out.includes("2 steps"), "thinking tools excluded from total (2, not 4)");
+  assert.ok(!out.includes("💭"), "no thinking emoji in counters");
+  assert.ok(!out.includes("Thinking"), "no thinking entry in blockquote");
+  assert.ok(out.includes("✓ <b>Read</b>"), "non-thinking steps still rendered");
+  assert.ok(out.includes("✓ <b>Bash</b>"), "non-thinking steps still rendered");
+});
+
+test("renderActivity: bash with failed result upgrades prefix to ✗ and (failed) suffix", () => {
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Bash", input: { command: "git status" }, result: { content: "ok\n", isError: false } },
+      { name: "Bash", input: { command: "git push" }, result: { content: "denied", isError: true } },
+    ],
+    executionId: "x-bashfail",
+    durationMs: 4_000,
+  });
+  assert.ok(out.includes("✓ <b>Bash</b> <code>git status</code>"), "successful bash uses ✓");
+  assert.ok(out.includes("✗ <b>Bash</b> <code>git push</code>"), "failed bash uses ✗");
+  assert.ok(out.includes("(failed)"), "failed bash carries (failed) suffix");
+});
+
+test("renderActivity: result suffixes render for each tool category", () => {
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Read", input: { file_path: "/a.ts" }, result: { content: "line1\nline2\nline3\n" } },
+      { name: "Bash", input: { command: "ls" }, result: { content: "a\nb\nc\nd\ne\n" } },
+      { name: "Edit", input: { file_path: "/a.ts" }, result: { content: "Applied 1 edit: +12 -3" } },
+      { name: "Grep", input: { pattern: "foo" }, result: { content: "a.ts:1: foo\nb.ts:2: foo\n" } },
+      { name: "Glob", input: { pattern: "*.ts" }, result: { content: "a.ts\nb.ts\nc.ts\n" } },
+    ],
+    executionId: "x-suffix",
+    durationMs: 6_000,
+  });
+  assert.ok(out.includes("(3 lines)"), "read shows line count");
+  assert.ok(out.includes("(5 lines)"), "bash shows stdout line count");
+  assert.ok(out.includes("(-3 +12)"), "edit shows diff stats parsed from confirmation");
+  assert.ok(out.includes("(2 matches)"), "grep shows match count");
+  assert.ok(out.includes("(3 files)"), "glob shows file count");
+});
+
+test("renderActivity: tools without results render without suffix (graceful degradation)", () => {
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Read", input: { file_path: "/a.ts" } }, // no result
+      { name: "Bash", input: { command: "ls" } }, // no result
+    ],
+    executionId: "x-noresult",
+    durationMs: 2_000,
+  });
+  assert.ok(out.includes("✓ <b>Read</b> <code>a.ts</code>"), "read rendered without suffix");
+  assert.ok(out.includes("✓ <b>Bash</b> <code>ls</code>"), "bash rendered without suffix");
+  assert.ok(!out.includes("(0 lines)"), "no spurious (0 lines) suffix when result is absent");
+});
+
+test("renderActivity: edit without parseable diff stats falls back to (updated)", () => {
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Edit", input: { file_path: "/a.ts" }, result: { content: "Edit applied successfully." } },
+    ],
+    executionId: "x-edit",
+    durationMs: 1_000,
+  });
+  assert.ok(out.includes("(updated)"), "unparseable edit result falls back to (updated)");
+});
+
+test("renderActivity: grep with no matches renders (no matches), glob with no files renders (no files)", () => {
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Grep", input: { pattern: "missing" }, result: { content: "" } },
+      { name: "Glob", input: { pattern: "*.xyz" }, result: { content: "" } },
+    ],
+    executionId: "x-empty",
+    durationMs: 500,
+  });
+  assert.ok(out.includes("(no matches)"), "grep with empty result");
+  assert.ok(out.includes("(no files)"), "glob with empty result");
+});
+
+test("renderActivity: agent result first line truncated to 40 chars in quotes", () => {
+  const longResponse = "This is a fairly long agent reply that should be truncated past the forty char limit.";
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Task", input: { description: "research" }, result: { content: longResponse } },
+    ],
+    executionId: "x-agent",
+    durationMs: 3_000,
+  });
+  assert.ok(out.includes('"This is a fairly long agent reply'), "agent first line shown in quotes");
+  assert.ok(out.includes("..."), "long agent result is truncated");
+  assert.ok(!out.includes("forty char limit"), "truncated tail dropped from suffix");
+});
+
+test("renderActivity: agent result with short first line not truncated", () => {
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Task", input: { description: "x" }, result: { content: "Done; 3 files changed" } },
+    ],
+    executionId: "x-agent-short",
+    durationMs: 2_000,
+  });
+  assert.ok(out.includes('("Done; 3 files changed")'), "short agent reply renders verbatim in quotes");
+});
+
+test("formatToolResultSuffix: handles missing/empty content gracefully", () => {
+  assert.equal(formatToolResultSuffix("Read", undefined), undefined);
+  assert.equal(formatToolResultSuffix("WebFetch", { content: "anything" }), undefined);
+  assert.equal(formatToolResultSuffix("Read", { content: "" }), "(0 lines)");
+});
+
+test("formatToolDisplay: tools use friendly display names per the spec map", () => {
+  // Smoke-check via renderActivity since formatToolDisplay isn't exported
+  const out = renderActivity({
+    status: "complete",
+    tools: [
+      { name: "Grep", input: { pattern: "x" } },
+      { name: "Task", input: { description: "y" } },
+      { name: "MultiEdit", input: { file_path: "/a.ts" } },
+    ],
+    executionId: "x-names",
+    durationMs: 1_000,
+  });
+  assert.ok(out.includes("<b>Search</b>"), "Grep renders as Search");
+  assert.ok(out.includes("<b>Agent</b>"), "Task renders as Agent");
+  assert.ok(out.includes("<b>Edit</b>"), "MultiEdit renders as Edit");
 });
