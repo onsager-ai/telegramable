@@ -15,6 +15,7 @@ import { MemoryWorkerQueue } from "../memory/worker/workerQueue";
 import { WorkerJobRunner } from "../memory/worker/types";
 import { FileSessionStore } from "../runtime/session/fileSessionStore";
 import { SessionStore, UNTITLED } from "../runtime/session/sessionStore";
+import { FileUsageStore } from "../runtime/usageStore";
 import { ChunkThrottler } from "./chunkThrottler";
 import { ExecutionRegistry, InMemoryExecutionRegistry } from "./executionRegistry";
 import { markdownToTelegramHtml } from "./markdownToHtml";
@@ -168,6 +169,25 @@ const formatEvent = (event: ExecutionEvent): string | null => {
     default:
       return null;
   }
+};
+
+const formatTokens = (n: number): string => {
+  if (n < 1_000) return String(n);
+  if (n < 1_000_000) return `${(n / 1_000).toFixed(n < 10_000 ? 1 : 0)}k`;
+  return `${(n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0)}M`;
+};
+
+const formatCost = (usd: number): string => {
+  if (usd === 0) return "$0";
+  if (usd < 0.01) return "<$0.01";
+  if (usd < 1) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(2)}`;
+};
+
+const formatUsage = (u: { inputTokens: number; outputTokens: number; cacheTokens: number; costUsd: number }): string => {
+  const total = u.inputTokens + u.outputTokens + u.cacheTokens;
+  if (total === 0 && u.costUsd === 0) return "— tokens · $—";
+  return `${formatTokens(total)} tokens · ${formatCost(u.costUsd)}`;
 };
 
 const PERMISSION_CALLBACK_PREFIX = "perm:";
@@ -608,6 +628,7 @@ export class ChannelHub {
       queue: MemoryWorkerQueue;
       runner: WorkerJobRunner;
     },
+    private readonly usageStore?: FileUsageStore,
   ) {
     this.executionRegistry = executionRegistry ?? new InMemoryExecutionRegistry();
     this.permissionBridge = new PermissionBridge(logger);
@@ -1371,6 +1392,14 @@ export class ChannelHub {
       case "error":
         this.executionRegistry.error(event.executionId, event.payload?.reason || "unknown", event.timestamp);
         break;
+      case "usage": {
+        const usage = event.payload?.usage;
+        const agentName = event.payload?.agentName;
+        if (this.usageStore && usage && agentName) {
+          this.usageStore.add(event.channelId, event.chatId, agentName, usage);
+        }
+        break;
+      }
       default:
         break;
     }
@@ -2101,7 +2130,7 @@ export class ChannelHub {
     if (command.type === "new") {
       const ctx = this.resolveSessionContext(message);
       if (!ctx) {
-        await adapter.sendMessage(message.chatId, "Sessions not available for this agent.");
+        await adapter.sendMessage(message.chatId, "Sessions are not persisted for this agent. Set <code>DATA_DIR</code> in the environment to enable /new and /sessions.");
         return;
       }
       ctx.store.createSession(ctx.storeKey, randomUUID(), UNTITLED);
@@ -2118,7 +2147,7 @@ export class ChannelHub {
         ? "<i>⚠ /list is deprecated — use /sessions</i>\n\n"
         : "";
       if (!ctx) {
-        await adapter.sendMessage(message.chatId, `${deprecationHint}Sessions not available for this agent.`);
+        await adapter.sendMessage(message.chatId, `${deprecationHint}Sessions are not persisted for this agent. Set <code>DATA_DIR</code> in the environment to enable /new and /sessions.`);
         return;
       }
       const value = ctx.store.getValue(ctx.storeKey);
@@ -2143,12 +2172,22 @@ export class ChannelHub {
     }
 
     if (command.type === "usage") {
+      const ctx = this.resolveSessionContext(message);
+      if (!this.usageStore || !ctx) {
+        // No store (DATA_DIR unset) or no agentName resolvable — we have no way
+        // to scope a query, so be explicit rather than show misleading zeros.
+        await adapter.sendMessage(
+          message.chatId,
+          "📊 <b>Usage</b>\nNot available — set <code>DATA_DIR</code> in the environment to persist token + cost tracking.",
+        );
+        return;
+      }
+      const today = this.usageStore.sumToday(message.channelId, message.chatId, ctx.agentName);
+      const month = this.usageStore.sumThisMonth(message.channelId, message.chatId, ctx.agentName);
       const lines = [
-        "📊 <b>Usage</b> (stub)",
-        "Today: — tokens · $—",
-        "This month: — tokens · $—",
-        "",
-        "<i>Real wiring tracked in #109</i>",
+        "📊 <b>Usage</b>",
+        `Today: ${formatUsage(today)}`,
+        `This month: ${formatUsage(month)}`,
       ];
       await adapter.sendMessage(message.chatId, lines.join("\n"));
       return;

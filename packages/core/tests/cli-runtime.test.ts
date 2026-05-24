@@ -704,11 +704,18 @@ test("CliRuntime resets idle session across simulated process restart via fileSt
     await r1.execute(msg(), "exec-restart-1", new EventBus());
 
     // Simulate disk-state aging past idle threshold by rewriting the persisted
-    // timestamp to long ago. (Equivalent to a real restart hours later.)
+    // timestamp to long ago. (Equivalent to a real restart hours later.) Post
+    // multi-session refactor the file entries hold a JSON-encoded
+    // SessionStoreValue inside `id`; we mutate the embedded `lastUsedAt`.
     const sessionsPath = path.join(dataDir, "cli-sessions.json");
     const data = JSON.parse(readFileSync(sessionsPath, "utf-8")) as Record<string, { id: string; lastUsedAt: number }>;
     for (const k of Object.keys(data)) {
-      data[k].lastUsedAt = 0; // far in the past
+      const value = JSON.parse(data[k].id) as { active: string; sessions: Record<string, { lastUsedAt: number }> };
+      for (const sub of Object.values(value.sessions)) {
+        sub.lastUsedAt = 0;
+      }
+      data[k].id = JSON.stringify(value);
+      data[k].lastUsedAt = 0;
     }
     writeFileSync(sessionsPath, JSON.stringify(data), "utf-8");
 
@@ -723,9 +730,9 @@ test("CliRuntime resets idle session across simulated process restart via fileSt
   });
 });
 
-test("CliRuntime tolerates legacy bare-string entries in cli-sessions.json", async () => {
+test("CliRuntime migrates pre-multi-session bare-string entries and resumes them", async () => {
   await withTempCliDir(async (dataDir) => {
-    // Pre-write a legacy bare-string file
+    // Pre-write a legacy bare-string file keyed by the old 2-part `${channelId}::${chatId}` form.
     const sessionsPath = path.join(dataDir, "cli-sessions.json");
     writeFileSync(sessionsPath, JSON.stringify({ "telegram::chat-1": "legacy-session-id" }), "utf-8");
 
@@ -735,9 +742,12 @@ test("CliRuntime tolerates legacy bare-string entries in cli-sessions.json", asy
     const ev = collect(eb);
     await runtime.execute(msg(), "exec-legacy-1", eb);
     const out = ev.filter((e) => e.type === "stream-text").map((e) => e.payload?.text).join("");
-    // Legacy entry has lastUsedAt=0, so it's treated as expired → fresh --session-id
-    assert.ok(out.includes("--session-id"), "legacy entry should be treated as expired and trigger fresh --session-id");
-    assert.ok(!out.includes("--resume"), "legacy entry must not be --resume'd");
+    // Legacy 2-part key is migrated to `telegram::chat-1::legacy-agent`, then SessionStore
+    // wraps the bare resumeId as a "Restored session" sub-session — so this turn resumes it
+    // rather than discarding the user's prior Claude conversation across an upgrade.
+    assert.ok(out.includes("--resume"), "migrated legacy entry should be --resume'd");
+    assert.ok(out.includes("legacy-session-id"), "the legacy resumeId should be passed to --resume");
+    assert.ok(!out.includes("--session-id"), "migrated entry must not fall back to --session-id");
   });
 });
 

@@ -63,6 +63,10 @@ export class FileSessionStore {
     return this.data[key];
   }
 
+  keys(): string[] {
+    return Object.keys(this.data);
+  }
+
   set(key: string, id: string, lastUsedAt: number): void {
     this.data[key] = { id, lastUsedAt };
     this.save();
@@ -71,6 +75,15 @@ export class FileSessionStore {
   delete(key: string): void {
     delete this.data[key];
     this.save();
+  }
+
+  /** Rename a key in-place, preserving the entry. No-op if `from` doesn't exist or `to` already does. */
+  rename(from: string, to: string): boolean {
+    if (from === to || !this.data[from] || this.data[to]) return false;
+    this.data[to] = this.data[from];
+    delete this.data[from];
+    this.save();
+    return true;
   }
 
   private load(): Record<string, FileSessionEntry> {

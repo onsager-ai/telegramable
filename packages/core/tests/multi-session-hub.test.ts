@@ -10,6 +10,7 @@ import { Router } from "../src/hub/router";
 import { Runtime } from "../src/runtime/types";
 import { FileSessionStore } from "../src/runtime/session/fileSessionStore";
 import { SessionStore, UNTITLED } from "../src/runtime/session/sessionStore";
+import { FileUsageStore } from "../src/runtime/usageStore";
 import { MockAdapter } from "./mockAdapter";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -20,10 +21,10 @@ const withTempDir = async (fn: (dir: string) => Promise<void>): Promise<void> =>
 };
 
 /** Wraps a test in `withTempDir` + builds a hub that's auto-stopped after the test. */
-const withHub = (fn: (ctx: BuildResult) => Promise<void>): () => Promise<void> => {
+const withHub = (fn: (ctx: BuildResult) => Promise<void>, opts?: BuildOptions): () => Promise<void> => {
   return async () => {
     await withTempDir(async (dir) => {
-      const ctx = buildHub(dir);
+      const ctx = buildHub(dir, opts);
       await ctx.hub.start();
       try {
         await fn(ctx);
@@ -38,16 +39,25 @@ interface BuildResult {
   hub: ChannelHub;
   adapter: MockAdapter;
   sessionStore: SessionStore;
+  usageStore?: FileUsageStore;
+  eventBus: EventBus;
   executeCalls: number;
 }
 
-function buildHub(dir: string, agentName: string = "claude"): BuildResult {
+interface BuildOptions {
+  agentName?: string;
+  withUsageStore?: boolean;
+}
+
+function buildHub(dir: string, opts: BuildOptions = {}): BuildResult {
+  const agentName = opts.agentName ?? "claude";
   const adapter = new MockAdapter("telegram");
   const eventBus = new EventBus();
   const logger = createLogger("error");
 
   const fileStore = new FileSessionStore(dir, `${agentName}-sessions.json`, logger);
   const sessionStore = new SessionStore(fileStore);
+  const usageStore = opts.withUsageStore ? new FileUsageStore(dir, "usage.json", logger) : undefined;
 
   const state = { executeCalls: 0 };
 
@@ -73,9 +83,21 @@ function buildHub(dir: string, agentName: string = "claude"): BuildResult {
     },
   };
 
-  const hub = new ChannelHub([adapter], router, eventBus, logger);
+  const hub = new ChannelHub(
+    [adapter],
+    router,
+    eventBus,
+    logger,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    usageStore,
+  );
 
-  return Object.assign(state, { hub, adapter, sessionStore });
+  return Object.assign(state, { hub, adapter, sessionStore, usageStore, eventBus });
 }
 
 // --- parser ---
@@ -217,11 +239,45 @@ test("sess:switch:<id> on a broken session shows 'Session unavailable.'", withHu
 
 // --- /usage and /stop stubs ---
 
-test("/usage replies with the stub message linking the follow-up", withHub(async ({ adapter }) => {
+test("/usage without a UsageStore reports unavailable and points at DATA_DIR", withHub(async ({ adapter }) => {
+  // buildHub() does not pass a usageStore, so /usage falls into the "not available" branch.
   await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "/usage" });
   await sleep(30);
-  assert.ok(adapter.sentMessages.some((m) => m.text.includes("Real wiring tracked in #109")));
+  const found = adapter.sentMessages.some((m) => m.text.includes("DATA_DIR"));
+  assert.ok(found, "should hint at DATA_DIR when no UsageStore is wired");
 }));
+
+test(
+  "/usage reports today + month totals when a runtime emits usage events",
+  withHub(
+    async ({ adapter, eventBus }) => {
+      // Inject two usage events through the bus the way ClaudeSession would.
+      const emit = (input: number, output: number, cache: number, cost: number) => {
+        eventBus.emit({
+          executionId: `exec-${input}`,
+          channelId: "telegram",
+          chatId: "chat-1",
+          type: "usage",
+          timestamp: Date.now(),
+          payload: { agentName: "claude", usage: { inputTokens: input, outputTokens: output, cacheTokens: cache, costUsd: cost } },
+        });
+      };
+      emit(1200, 800, 500, 0.012);
+      emit(300, 200, 0, 0.003);
+      await sleep(20);
+
+      await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "/usage" });
+      await sleep(30);
+
+      const reply = adapter.sentMessages[adapter.sentMessages.length - 1]?.text || "";
+      assert.ok(reply.includes("📊 <b>Usage</b>"), "should render the Usage header");
+      // 1500 in + 1000 out + 500 cache = 3000 tokens → "3.0k tokens"; cost 0.015 → "$0.015".
+      assert.ok(reply.includes("3.0k tokens"), `expected totals in reply, got: ${reply}`);
+      assert.ok(reply.includes("$0.015"), `expected cost in reply, got: ${reply}`);
+    },
+    { withUsageStore: true },
+  ),
+);
 
 test("/stop replies with cancellation-not-wired hint linking the follow-up", withHub(async ({ adapter }) => {
   await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "/stop" });

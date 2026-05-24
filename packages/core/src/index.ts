@@ -20,6 +20,7 @@ import { PendingTurnsStore } from "./memory/worker/persistence";
 import { MemoryWorkerQueue } from "./memory/worker/workerQueue";
 import { createAgentRegistry } from "./runtime";
 import { FileSessionStore } from "./runtime/session/fileSessionStore";
+import { FileUsageStore } from "./runtime/usageStore";
 
 export { loadConfig, loadEnv } from "./config";
 
@@ -188,6 +189,11 @@ export async function startDaemon(): Promise<void> {
     logger.info("Memory worker wired.", { claudeCommand, persistence: !!persistence });
   }
 
+  const usageStore = config.dataDir ? new FileUsageStore(config.dataDir, "usage.json", logger) : undefined;
+  if (!usageStore) {
+    logger.warn("No DATA_DIR configured — /usage will report unavailable.");
+  }
+
   const hub = new ChannelHub(
     adapters,
     router,
@@ -199,6 +205,7 @@ export async function startDaemon(): Promise<void> {
     memorySync,
     refinementScheduler,
     memoryWorkerWiring,
+    usageStore,
   );
 
   await hub.start();
