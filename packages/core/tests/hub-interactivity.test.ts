@@ -734,7 +734,7 @@ test("renderActivity: empty tools produces header only", () => {
   assert.ok(!out.includes("·"), "no extras (steps/duration) when empty and no duration");
 });
 
-test("renderActivity: single running tool shows step count and current cue but no blockquote", () => {
+test("renderActivity: single running tool shows step count and current cue but no past-steps blockquote", () => {
   const out = renderActivity({
     status: "running",
     tools: [{ name: "Read", input: { file_path: "/tmp/a.ts" } }],
@@ -743,11 +743,13 @@ test("renderActivity: single running tool shows step count and current cue but n
   assert.ok(out.includes("⚙️ <b>Working</b>"), "running header");
   assert.ok(out.includes("1 step"), "1 step in header");
   assert.ok(out.includes("📖1"), "counter line with read=1");
-  assert.ok(out.includes("· ▸"), "current tool cue while running");
-  assert.ok(out.includes("<b>Read</b>"), "tool display name");
+  assert.ok(out.includes("▸ <b>Read</b>"), "current tool cue rendered below counter with bold name");
   assert.ok(out.includes("<code>a.ts</code>"), "primary arg is basename in code");
-  assert.ok(!out.includes("<blockquote"), "running state skips blockquote for non-Bash tools to keep edits short");
+  assert.ok(!out.includes("<blockquote"), "single running tool has no past-step blockquote (and non-bash, so no command pre)");
   assert.ok(!out.includes("Reading"), "no verb-based descriptor in unified template");
+  // The current step should be on its own line, not appended to the counter row.
+  const counterLine = out.split("\n").find((l) => l.includes("📖1"));
+  assert.ok(counterLine && !counterLine.includes("▸"), "current cue is not appended to counter line");
 });
 
 test("renderActivity: running Bash with short command renders expandable <pre> block, no inline <code>", () => {
@@ -758,7 +760,7 @@ test("renderActivity: running Bash with short command renders expandable <pre> b
   });
   assert.ok(out.includes("⚙️ <b>Working</b>"), "running header");
   assert.ok(out.includes("⚡1"), "counter line with bash=1");
-  assert.ok(out.includes("· ▸ <b>Bash</b>"), "counter line ends with bold Bash, no trailing inline <code>");
+  assert.ok(out.includes("▸ <b>Bash</b>"), "current step renders as bold Bash, no trailing inline <code>");
   assert.ok(
     out.includes(`<blockquote expandable><pre><code class="language-bash">ls -la</code></pre></blockquote>`),
     "command body wrapped in expandable blockquote with language-bash hint",
@@ -766,6 +768,53 @@ test("renderActivity: running Bash with short command renders expandable <pre> b
   // Counter line must not carry the command inline.
   const counterLine = out.split("\n").find((l) => l.includes("⚡1"));
   assert.ok(counterLine && !counterLine.includes("<code>"), "no inline <code> on counter line for Bash");
+  assert.ok(counterLine && !counterLine.includes("▸"), "current cue is not appended to counter line");
+});
+
+test("renderActivity: running with past steps keeps completed ones visible with ✓ in expandable blockquote", () => {
+  const out = renderActivity({
+    status: "running",
+    tools: [
+      { name: "Read", input: { file_path: "/a.ts" }, result: { content: "line1\nline2\n" } },
+      { name: "Read", input: { file_path: "/b.ts" }, result: { content: "x\n" } },
+      { name: "Edit", input: { file_path: "/a.ts" } }, // current
+    ],
+    executionId: "x-running-past",
+  });
+  assert.ok(out.includes("⚙️ <b>Working</b>"), "running header");
+  assert.ok(out.includes("3 steps"), "total step count");
+  // Past steps appear with ✓ inside the expandable blockquote.
+  assert.ok(out.includes("<blockquote expandable>"), "past steps rendered in expandable blockquote");
+  assert.ok(out.includes("✓ <b>Read</b> <code>a.ts</code>"), "first past step uses ✓ with result suffix");
+  assert.ok(out.includes("(2 lines)"), "completed Read carries its result suffix in running state");
+  // Current step appears below the blockquote with ▸ — no flashing/replacement.
+  assert.ok(out.includes("▸ <b>Edit</b> <code>a.ts</code>"), "current step uses ▸ with bold name");
+  // The blockquote must be closed before the ▸ line so the current step sits outside it.
+  const blockquoteEndIdx = out.indexOf("</blockquote>");
+  const currentCueIdx = out.lastIndexOf("▸");
+  assert.ok(blockquoteEndIdx > 0 && currentCueIdx > blockquoteEndIdx, "current step rendered after blockquote close");
+});
+
+test("renderActivity: running with past steps and current Bash places past-steps blockquote before the bash <pre> blockquote", () => {
+  const out = renderActivity({
+    status: "running",
+    tools: [
+      { name: "Read", input: { file_path: "/a.ts" } },
+      { name: "Bash", input: { command: "pnpm test" } }, // current
+    ],
+    executionId: "x-running-past-bash",
+  });
+  assert.ok(out.includes("✓ <b>Read</b>"), "past Read step uses ✓");
+  assert.ok(out.includes("▸ <b>Bash</b>"), "current Bash step uses ▸");
+  assert.ok(
+    out.includes(`<blockquote expandable><pre><code class="language-bash">pnpm test</code></pre></blockquote>`),
+    "current Bash command body wrapped in expandable blockquote with language-bash hint",
+  );
+  // Past-steps blockquote must come before the current ▸ line and the bash pre blockquote.
+  const pastBqIdx = out.indexOf("✓ <b>Read</b>");
+  const currentCueIdx = out.indexOf("▸ <b>Bash</b>");
+  const bashPreIdx = out.indexOf("language-bash");
+  assert.ok(pastBqIdx < currentCueIdx && currentCueIdx < bashPreIdx, "order: past steps → ▸ Bash → bash pre");
 });
 
 test("renderActivity: running Bash with multi-line command preserves newlines and escapes HTML once", () => {
@@ -868,8 +917,9 @@ test("renderActivity: 200-step done run truncates blockquote contents with /logs
   // — Telegram rejects the edit in that case and the previous "Working"
   // status remains visible, which is an acceptable graceful failure mode.
   //
-  // Note: running-state activities skip the blockquote entirely; the
-  // truncation hint only applies once the run completes.
+  // Note: running-state activities also use the blockquote (for past steps)
+  // so the truncation hint applies there too; this test covers the completed
+  // state where all steps are in the blockquote.
   const tools = Array.from({ length: 200 }, (_, i) => ({
     name: "Read",
     input: { file_path: `/f${i}.ts` },
