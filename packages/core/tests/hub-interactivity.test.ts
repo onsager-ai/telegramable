@@ -107,7 +107,8 @@ test("ChannelHub supports /status /logs /list without routing to runtime", async
 
   assert.ok(adapter.sentMessages.some((message) => message.text.includes("✅") && message.text.includes("Complete")));
   assert.ok(adapter.sentMessages.some((message) => message.text.includes("[stdout] Analyzing project structure...")));
-  assert.ok(adapter.sentMessages.some((message) => message.text.includes("Recent executions")));
+  // /list is the deprecated alias of /sessions (#107) — should surface the deprecation hint.
+  assert.ok(adapter.sentMessages.some((message) => message.text.includes("/list is deprecated")));
   assert.ok(adapter.sentMessages.some((message) => message.text.includes("Unknown execution ID: unknown-id")));
 
   await hub.stop();
