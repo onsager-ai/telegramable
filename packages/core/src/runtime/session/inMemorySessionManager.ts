@@ -1,9 +1,11 @@
 import { Logger } from "../../logging";
-import { FileSessionStore } from "./fileSessionStore";
+import { SessionStore } from "./sessionStore";
 import { AgentSession, SessionFactory, SessionManager } from "./types";
 
 interface SessionEntry {
-  key: string;
+  cacheKey: string;
+  storeKey: string;
+  sessionId: string;
   session: AgentSession;
   lastUsedAt: number;
 }
@@ -13,26 +15,58 @@ interface InMemorySessionManagerOptions {
   createSession: SessionFactory;
   logger: Logger;
   now?: () => number;
-  fileStore?: FileSessionStore;
+  /** Multi-session metadata store. When omitted, every getOrCreate uses a synthetic singleton sessionId. */
+  sessionStore?: SessionStore;
 }
 
+const SINGLETON_SUB_ID = "default";
+
 export class InMemorySessionManager implements SessionManager {
+  /** Keyed by `${storeKey}::${sessionId}` so different sub-sessions live as independent AgentSession instances. */
   private readonly sessions = new Map<string, SessionEntry>();
+  /** Per-`storeKey` tracker of which sub-session was last acquired. Used to lazily close the prior one on switch. */
+  private readonly lastAcquiredSubId = new Map<string, string>();
   private readonly sessionTimeoutMs: number;
   private readonly now: () => number;
-  private readonly fileStore?: FileSessionStore;
+  private readonly sessionStore?: SessionStore;
 
   constructor(private readonly options: InMemorySessionManagerOptions) {
     this.sessionTimeoutMs = options.sessionTimeoutMs ?? 30 * 60 * 1000;
     this.now = options.now ?? (() => Date.now());
-    this.fileStore = options.fileStore;
+    this.sessionStore = options.sessionStore;
   }
 
   getOrCreate(channelId: string, chatId: string, agentName: string): AgentSession {
     this.evictIdleSessions();
-    const key = this.key(channelId, chatId, agentName);
-    const existing = this.sessions.get(key);
+    const storeKey = this.storeKey(channelId, chatId, agentName);
 
+    // Resolve the active sub-session id from the metadata store. If no entry exists
+    // yet, fall back to a singleton id so single-session callers still work.
+    const active = this.sessionStore?.getActiveSession(storeKey);
+    const subId = active?.sessionId ?? SINGLETON_SUB_ID;
+    const cacheKey = this.cacheKey(storeKey, subId);
+
+    // Lazy close: if the caller acquired a different sub-session than last time
+    // (i.e. switched via /sessions [Switch]), close the previously cached one so
+    // its child process / stream state is released. The user may switch back
+    // later — we'll recreate it then.
+    const prevSubId = this.lastAcquiredSubId.get(storeKey);
+    if (prevSubId && prevSubId !== subId) {
+      const prevCacheKey = this.cacheKey(storeKey, prevSubId);
+      const prev = this.sessions.get(prevCacheKey);
+      if (prev) {
+        this.sessions.delete(prevCacheKey);
+        void prev.session.close().catch((error) => {
+          this.options.logger.warn("Failed to close previously active sub-session.", {
+            sessionId: prev.session.sessionId,
+            reason: error instanceof Error ? error.message : "unknown",
+          });
+        });
+      }
+    }
+    this.lastAcquiredSubId.set(storeKey, subId);
+
+    const existing = this.sessions.get(cacheKey);
     if (existing) {
       existing.lastUsedAt = this.now();
       return existing.session;
@@ -43,63 +77,61 @@ export class InMemorySessionManager implements SessionManager {
     // Restore persisted resume ID so the session continues a prior conversation,
     // but skip restoration if the persisted entry is older than sessionTimeoutMs —
     // a stale resume across a restart should reset just like an in-process idle.
-    const persisted = this.fileStore?.get(key);
-    if (persisted) {
-      const idleMs = this.now() - persisted.lastUsedAt;
+    const persistedResume = active?.meta.resumeId;
+    const persistedLastUsedAt = active?.meta.lastUsedAt ?? 0;
+    if (persistedResume && !active?.meta.broken) {
+      const idleMs = this.now() - persistedLastUsedAt;
       if (idleMs > this.sessionTimeoutMs) {
-        this.fileStore?.delete(key);
         this.options.logger.debug("Discarded stale persisted session.", {
           sessionId: session.sessionId,
-          resumeId: persisted.id,
+          resumeId: persistedResume,
           idleMs,
           channelId,
           chatId,
-          agentName
+          agentName,
         });
       } else if (session.setResumeId) {
-        session.setResumeId(persisted.id);
+        session.setResumeId(persistedResume);
         this.options.logger.debug("Restored session resume ID from disk.", {
           sessionId: session.sessionId,
-          resumeId: persisted.id,
+          resumeId: persistedResume,
           channelId,
           chatId,
-          agentName
+          agentName,
         });
       }
     }
 
-    this.sessions.set(key, {
-      key,
+    this.sessions.set(cacheKey, {
+      cacheKey,
+      storeKey,
+      sessionId: subId,
       session,
-      lastUsedAt: this.now()
+      lastUsedAt: this.now(),
     });
 
     this.options.logger.debug("Created new session.", {
       sessionId: session.sessionId,
+      subSessionId: subId,
       channelId,
       chatId,
-      agentName
+      agentName,
     });
 
     return session;
   }
 
   async close(channelId: string, chatId: string): Promise<void> {
-    const keys = Array.from(this.sessions.keys()).filter((key) => {
-      const [storedChannelId, storedChatId] = key.split("::");
-      return storedChannelId === channelId && storedChatId === chatId;
-    });
+    const prefix = `${channelId}::${chatId}::`;
+    const matches = Array.from(this.sessions.values()).filter((entry) => entry.storeKey.startsWith(prefix));
 
-    await Promise.all(keys.map(async (key) => {
-      const entry = this.sessions.get(key);
-      if (!entry) {
-        return;
-      }
-
+    await Promise.all(matches.map(async (entry) => {
+      this.sessions.delete(entry.cacheKey);
+      this.lastAcquiredSubId.delete(entry.storeKey);
       try {
         await entry.session.close();
-      } finally {
-        this.sessions.delete(key);
+      } catch {
+        // best-effort
       }
     }));
   }
@@ -107,6 +139,7 @@ export class InMemorySessionManager implements SessionManager {
   async closeAll(): Promise<void> {
     const entries = Array.from(this.sessions.values());
     this.sessions.clear();
+    this.lastAcquiredSubId.clear();
     await Promise.all(entries.map(async (entry) => entry.session.close()));
   }
 
@@ -117,23 +150,27 @@ export class InMemorySessionManager implements SessionManager {
     });
 
     for (const entry of stale) {
-      this.sessions.delete(entry.key);
-      // Drop the persisted resume ID too — otherwise a restart would restore
-      // a session we just decided is stale.
-      this.fileStore?.delete(entry.key);
+      this.sessions.delete(entry.cacheKey);
+      if (this.lastAcquiredSubId.get(entry.storeKey) === entry.sessionId) {
+        this.lastAcquiredSubId.delete(entry.storeKey);
+      }
       void entry.session.close().catch((error) => {
         this.options.logger.warn("Failed to close idle session.", {
           sessionId: entry.session.sessionId,
-          reason: error instanceof Error ? error.message : "unknown"
+          reason: error instanceof Error ? error.message : "unknown",
         });
       });
       this.options.logger.debug("Evicted idle session.", {
-        sessionId: entry.session.sessionId
+        sessionId: entry.session.sessionId,
       });
     }
   }
 
-  private key(channelId: string, chatId: string, agentName: string): string {
+  private storeKey(channelId: string, chatId: string, agentName: string): string {
     return `${channelId}::${chatId}::${agentName}`;
+  }
+
+  private cacheKey(storeKey: string, subId: string): string {
+    return `${storeKey}::${subId}`;
   }
 }

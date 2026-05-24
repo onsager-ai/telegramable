@@ -5,16 +5,22 @@ import { Logger } from "../../logging";
 import { MemoryProvider } from "../../memory/provider";
 import { Runtime } from "../types";
 import { FileSessionStore } from "./fileSessionStore";
+import { SessionStore } from "./sessionStore";
 import { SessionManager } from "./types";
 
 export interface SessionRuntimeOptions {
   fileStore?: FileSessionStore;
+  sessionStore?: SessionStore;
   memoryProvider?: MemoryProvider;
 }
 
 export class SessionRuntime implements Runtime {
-  private readonly fileStore?: FileSessionStore;
+  readonly sessionStore?: SessionStore;
   private readonly memoryProvider?: MemoryProvider;
+
+  get agentName(): string {
+    return this.config.name;
+  }
 
   constructor(
     private readonly config: AgentConfig,
@@ -23,13 +29,15 @@ export class SessionRuntime implements Runtime {
     fileStoreOrOptions?: FileSessionStore | SessionRuntimeOptions,
     memoryProvider?: MemoryProvider
   ) {
-    // Support both old signature (fileStore, memoryProvider) and new options object
+    // Support legacy positional `(fileStore, memoryProvider)` callers as well as the
+    // options-object form. When only a raw FileSessionStore is provided we wrap it
+    // so the runtime path always speaks the multi-session API.
     if (fileStoreOrOptions && "get" in fileStoreOrOptions) {
-      this.fileStore = fileStoreOrOptions;
+      this.sessionStore = new SessionStore(fileStoreOrOptions);
       this.memoryProvider = memoryProvider;
     } else if (fileStoreOrOptions) {
       const opts = fileStoreOrOptions as SessionRuntimeOptions;
-      this.fileStore = opts.fileStore;
+      this.sessionStore = opts.sessionStore ?? (opts.fileStore ? new SessionStore(opts.fileStore) : undefined);
       this.memoryProvider = opts.memoryProvider;
     }
   }
@@ -50,13 +58,37 @@ export class SessionRuntime implements Runtime {
       payload: { agentName: this.config.name }
     });
 
+    // Snapshot the resumeId BEFORE the send so we can detect ClaudeSession's silent
+    // retry-on-resume-failure path: if `send()` succeeds but `session.resumeId`
+    // changed underneath us, the runtime's `--resume <id>` failed and it had to
+    // start a fresh native session — that's the signal we mark this sub-session
+    // broken so the user gets a clear strikethrough in /sessions instead of a
+    // silently-detached conversation.
+    const priorResumeId = session.resumeId;
+    const storeKey = `${message.channelId}::${message.chatId}::${this.config.name}`;
+    const active = this.sessionStore?.getActiveSession(storeKey);
+
     const response = await session.send(message.text, executionId, eventBus);
 
-    // Persist the session resume ID so conversations survive restarts.
-    // Stamp lastUsedAt so the next process can apply idle eviction across restarts.
-    if (session.resumeId && this.fileStore) {
-      const storeKey = `${message.channelId}::${message.chatId}::${this.config.name}`;
-      this.fileStore.set(storeKey, session.resumeId, Date.now());
+    // Persist the session resume ID + last-used stamp onto the active sub-session.
+    // If the runtime silently restarted (priorResumeId set but now differs), mark
+    // the sub-session broken — the user must /new to recover, per spec.
+    if (this.sessionStore && active) {
+      if (session.resumeId) {
+        this.sessionStore.setResumeId(storeKey, active.sessionId, session.resumeId);
+      }
+      this.sessionStore.touchLastUsed(storeKey, active.sessionId);
+
+      if (priorResumeId && session.resumeId && session.resumeId !== priorResumeId) {
+        this.sessionStore.markBroken(storeKey, active.sessionId);
+        this.logger.warn("Session resume failed; marked broken.", {
+          executionId,
+          storeKey,
+          sessionId: active.sessionId,
+          priorResumeId,
+          newResumeId: session.resumeId,
+        });
+      }
     }
 
     if (!response) {

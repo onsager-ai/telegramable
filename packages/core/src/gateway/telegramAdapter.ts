@@ -265,10 +265,12 @@ export class TelegramAdapter implements IMAdapter {
     if (!this.bot) return;
     try {
       await this.bot.api.setMyCommands([
-        { command: "start", description: "Welcome message and quick start guide" },
-        { command: "help", description: "Show available commands" },
+        { command: "new", description: "Start a new session" },
+        { command: "sessions", description: "List and switch sessions" },
+        { command: "stop", description: "Cancel the running task" },
         { command: "memory", description: "View and manage stored memories" },
-        { command: "list", description: "List recent executions" },
+        { command: "usage", description: "Token usage and cost" },
+        { command: "help", description: "Show all commands" },
       ]);
       this.logger.debug("Telegram bot commands registered.", { channelId: this.id });
     } catch (err) {

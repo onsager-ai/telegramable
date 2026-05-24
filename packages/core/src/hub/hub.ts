@@ -14,6 +14,7 @@ import { IdleScheduler } from "../memory/worker/idleScheduler";
 import { MemoryWorkerQueue } from "../memory/worker/workerQueue";
 import { WorkerJobRunner } from "../memory/worker/types";
 import { FileSessionStore } from "../runtime/session/fileSessionStore";
+import { SessionStore, UNTITLED } from "../runtime/session/sessionStore";
 import { ChunkThrottler } from "./chunkThrottler";
 import { ExecutionRegistry, InMemoryExecutionRegistry } from "./executionRegistry";
 import { markdownToTelegramHtml } from "./markdownToHtml";
@@ -25,6 +26,11 @@ import {
 } from "./memoryMarkup";
 import { PermissionBridge } from "./permissionBridge";
 import { Router } from "./router";
+import {
+  SESSIONS_CALLBACK_PREFIX,
+  buildSessionsListMarkup,
+  parseSessionsCallback,
+} from "./sessionsMarkup";
 import { SudoWatcher } from "./sudoWatcher";
 
 const TELEGRAM_MSG_LIMIT = 4000;
@@ -69,6 +75,10 @@ type BuiltinCommand =
   | { type: "status"; executionId: string }
   | { type: "logs"; executionId: string }
   | { type: "list" }
+  | { type: "new" }
+  | { type: "sessions" }
+  | { type: "stop" }
+  | { type: "usage" }
   | { type: "memory" }
   | { type: "memory-search"; query: string }
   | { type: "memory-edit"; id: string; text: string }
@@ -99,6 +109,12 @@ export const parseBuiltinCommand = (text: string): BuiltinCommand => {
   if (logsMatch?.[1]) {
     return { type: "logs", executionId: logsMatch[1] };
   }
+
+  // Multi-session commands (#107)
+  if (/^\/new\s*$/i.test(trimmed))      return { type: "new" };
+  if (/^\/sessions\s*$/i.test(trimmed)) return { type: "sessions" };
+  if (/^\/stop\s*$/i.test(trimmed))     return { type: "stop" };
+  if (/^\/usage\s*$/i.test(trimmed))    return { type: "usage" };
 
   if (/^\/list\s*$/i.test(trimmed)) {
     return { type: "list" };
@@ -865,6 +881,15 @@ export class ChannelHub {
       return;
     }
 
+    // Lazy-create the active sub-session for this (channel, chat, agent) slot so the
+    // /sessions list always reflects reality. On the first message ever, this creates
+    // a placeholder "Untitled session". The title backfill step below renames it
+    // from the user's first message text. Both run before the runtime dispatch so
+    // sessionRuntime's setResumeId/touchLastUsed always find an active entry.
+    if (message.text && message.text.trim().length > 0) {
+      this.ensureActiveSession(message, message.text);
+    }
+
     // Prepend quoted/reply message context so the agent sees what the user is replying to.
     // Truncate to avoid exceeding OS argv limits in CLI runtime path.
     const MAX_REPLY_CONTEXT = 500;
@@ -940,6 +965,11 @@ export class ChannelHub {
   }
 
   private async handleCallbackQuery(message: IMMessage): Promise<void> {
+    if (message.callbackData?.startsWith(SESSIONS_CALLBACK_PREFIX)) {
+      await this.handleSessionsCallback(message);
+      return;
+    }
+
     if (message.callbackData?.startsWith(MEMORY_CALLBACK_PREFIX)) {
       await this.handleMemoryCallback(message);
       return;
@@ -976,6 +1006,92 @@ export class ChannelHub {
       await adapter.editMessage(message.chatId, message.messageId, statusText).catch(() => {
         // Non-critical — message may have been deleted
       });
+    }
+  }
+
+  /**
+   * Resolve the multi-session metadata store and storeKey for an incoming
+   * message. Uses the same router path as runtime dispatch so the agent
+   * `@prefix` selection and channel defaults stay consistent.
+   *
+   * Returns `undefined` when the resolved runtime doesn't expose a sessionStore
+   * (e.g. CliRuntime, or a session runtime constructed without DATA_DIR).
+   */
+  private resolveSessionContext(message: IMMessage): { store: SessionStore; storeKey: string; agentName: string } | undefined {
+    const { runtime } = this.router.select(message);
+    if (!runtime.sessionStore || !runtime.agentName) return undefined;
+    const storeKey = `${message.channelId}::${message.chatId}::${runtime.agentName}`;
+    return { store: runtime.sessionStore, storeKey, agentName: runtime.agentName };
+  }
+
+  /**
+   * Lazy-create an active sub-session on the first user message in a slot, and
+   * backfill the placeholder title from the message text once we have it. No-op
+   * for runtimes without a SessionStore.
+   */
+  private ensureActiveSession(message: IMMessage, userText: string): void {
+    const ctx = this.resolveSessionContext(message);
+    if (!ctx) return;
+    const active = ctx.store.getActiveSession(ctx.storeKey);
+    if (!active) {
+      ctx.store.createSession(ctx.storeKey, randomUUID(), this.titleFromMessage(userText));
+      return;
+    }
+    if (active.meta.title === UNTITLED) {
+      ctx.store.setTitle(ctx.storeKey, active.sessionId, this.titleFromMessage(userText));
+    }
+  }
+
+  private titleFromMessage(text: string): string {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return UNTITLED;
+    return trimmed.length <= 40 ? trimmed : `${trimmed.slice(0, 40)}…`;
+  }
+
+  private async handleSessionsCallback(message: IMMessage): Promise<void> {
+    const adapter = this.adapters.get(message.channelId);
+    if (!adapter) return;
+
+    const ack = async (text?: string) => {
+      if (adapter.answerCallbackQuery && message.callbackQueryId) {
+        await adapter.answerCallbackQuery(message.callbackQueryId, text);
+      }
+    };
+
+    const parsed = parseSessionsCallback(message.callbackData ?? "");
+    if (!parsed) {
+      await ack();
+      return;
+    }
+
+    const ctx = this.resolveSessionContext(message);
+    if (!ctx) {
+      await ack("Sessions not available.");
+      return;
+    }
+
+    if (parsed.type === "switch") {
+      const value = ctx.store.getValue(ctx.storeKey);
+      const target = value?.sessions[parsed.sessionId];
+      if (!target) {
+        await ack("Session unavailable.");
+        return;
+      }
+      if (target.broken) {
+        await ack("Session unavailable.");
+        return;
+      }
+      ctx.store.switchActive(ctx.storeKey, parsed.sessionId);
+      await ack();
+
+      const titleText = escapeHtml(target.title || "Untitled session");
+      if (adapter.editMessageWithMarkup && message.messageId) {
+        const value2 = ctx.store.getValue(ctx.storeKey);
+        const sessions = ctx.store.listSessions(ctx.storeKey);
+        const { text, markup } = buildSessionsListMarkup(value2?.active, sessions);
+        await adapter.editMessageWithMarkup(message.chatId, message.messageId, text, markup).catch(() => {});
+      }
+      await adapter.sendMessage(message.chatId, `Switched to: <b>${titleText}</b>`);
     }
   }
 
@@ -1490,6 +1606,13 @@ export class ChannelHub {
       }
     }
 
+    // Summary fires BEFORE response chunks on `complete` so it appears above
+    // the answer (matches /memory and /sessions UX — context first, then payload).
+    // Error path keeps the original order: error text first, summary after.
+    if (event.type === "complete") {
+      await this.sendExecutionSummary(adapter, event, topicId);
+    }
+
     const text = formatEvent(event);
     if (text) {
       const chunks = splitMessage(text);
@@ -1498,10 +1621,11 @@ export class ChannelHub {
       }
     }
 
-    // Send execution summary after the response
-    if (event.type === "complete" || event.type === "error") {
+    if (event.type === "error") {
       await this.sendExecutionSummary(adapter, event, topicId);
-      // Close forum topic after all messages are sent
+    }
+
+    if (event.type === "complete" || event.type === "error") {
       this.closeForumTopicIfNeeded(adapter, event, topicId);
       this.cleanupDownloadedFiles(event.executionId);
     }
@@ -1935,30 +2059,84 @@ export class ChannelHub {
     command: Exclude<BuiltinCommand, null>
   ): Promise<void> {
     if (command.type === "start") {
-      const lines = [
-        "👋 <b>Welcome!</b> I'm your AI assistant on Telegram.",
-        "",
-        "Just send me a message and I'll respond. Use /help to see available commands.",
-      ];
-      await adapter.sendMessage(message.chatId, lines.join("\n"));
+      // /start removed per spec(runtime,gateway): multi-session support (#107);
+      // handler kept as silent no-op for one release.
       return;
     }
 
     if (command.type === "help") {
       const lines = [
-        "<b>Available commands:</b>",
+        "<b>Commands</b>",
         "",
-        "/memory — View and manage stored memories",
-        "/memory search &lt;query&gt; — Search memories",
-        "/memory edit &lt;id&gt; &lt;text&gt; — Update a memory",
-        "/memory delete &lt;id&gt; — Remove a memory",
-        "/memory export — Export memories as JSON",
-        "/memory clear — Clear all memories",
-        "/memory refine — Consolidate and deduplicate memories",
-        "/list — List recent executions",
-        "/status &lt;id&gt; — Check execution status",
-        "/logs &lt;id&gt; — View execution logs",
-        "/help — Show this message",
+        "🆕 /new — start a new session (current one preserved in /sessions)",
+        "📋 /sessions — list and switch sessions",
+        "⏹ /stop — cancel the running task",
+        "",
+        "🧠 /memory — view and manage stored memories",
+        "  /memory search &lt;query&gt;",
+        "  /memory refine",
+        "  (use buttons inside /memory for edit, delete, export, clear)",
+        "",
+        "💰 /usage — token usage and cost",
+        "❓ /help — this message",
+        "",
+        "<i>Hint: type / in the input box to see the menu.</i>",
+      ];
+      await adapter.sendMessage(message.chatId, lines.join("\n"));
+      return;
+    }
+
+    if (command.type === "new") {
+      const ctx = this.resolveSessionContext(message);
+      if (!ctx) {
+        await adapter.sendMessage(message.chatId, "Sessions not available for this agent.");
+        return;
+      }
+      ctx.store.createSession(ctx.storeKey, randomUUID(), UNTITLED);
+      await adapter.sendMessage(
+        message.chatId,
+        "Started a new session. Switch back anytime via /sessions.",
+      );
+      return;
+    }
+
+    if (command.type === "sessions" || command.type === "list") {
+      const ctx = this.resolveSessionContext(message);
+      const deprecationHint = command.type === "list"
+        ? "<i>⚠ /list is deprecated — use /sessions</i>\n\n"
+        : "";
+      if (!ctx) {
+        await adapter.sendMessage(message.chatId, `${deprecationHint}Sessions not available for this agent.`);
+        return;
+      }
+      const value = ctx.store.getValue(ctx.storeKey);
+      const sessions = ctx.store.listSessions(ctx.storeKey);
+      const { text, markup } = buildSessionsListMarkup(value?.active, sessions);
+      const finalText = `${deprecationHint}${text}`;
+      if (adapter.sendMessageWithMarkup && markup.inline_keyboard.length > 0) {
+        await adapter.sendMessageWithMarkup(message.chatId, finalText, markup);
+      } else {
+        await adapter.sendMessage(message.chatId, finalText);
+      }
+      return;
+    }
+
+    if (command.type === "stop") {
+      // Cancellation primitive not yet wired — see follow-up #108.
+      await adapter.sendMessage(
+        message.chatId,
+        "⚠ Cancellation not yet wired — see follow-up #108.",
+      );
+      return;
+    }
+
+    if (command.type === "usage") {
+      const lines = [
+        "📊 <b>Usage</b> (stub)",
+        "Today: — tokens · $—",
+        "This month: — tokens · $—",
+        "",
+        "<i>Real wiring tracked in #109</i>",
       ];
       await adapter.sendMessage(message.chatId, lines.join("\n"));
       return;
@@ -2112,27 +2290,6 @@ export class ChannelHub {
       } else {
         await adapter.sendMessage(message.chatId, JSON.stringify(this.memoryProvider.all(), null, 2));
       }
-      return;
-    }
-
-    if (command.type === "list") {
-      const records = this.executionRegistry.list(message.channelId, message.chatId).slice(0, 10);
-      if (records.length === 0) {
-        await adapter.sendMessage(message.chatId, "Recent executions (this chat):\n• (none)");
-        return;
-      }
-
-      const lines = records.map((record) => {
-        const icon = record.status === "complete" ? "✅" : record.status === "error" ? "❌" : "⏳";
-        const endTime = record.finishedAt ?? Date.now();
-        const durationStr = formatDuration(endTime - record.startedAt);
-        const toolCount = record.toolUses.length;
-        const shortId = record.executionId.slice(0, 8);
-        const toolInfo = toolCount > 0 ? ` · ${toolCount} tools` : "";
-        return `• <code>${shortId}</code> ${icon} ${durationStr}${toolInfo}`;
-      });
-
-      await adapter.sendMessage(message.chatId, `<b>Recent executions:</b>\n${lines.join("\n")}`);
       return;
     }
 
