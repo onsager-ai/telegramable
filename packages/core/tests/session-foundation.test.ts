@@ -11,6 +11,7 @@ import { createRuntime } from "../src/runtime";
 import { FileSessionStore } from "../src/runtime/session/fileSessionStore";
 import { InMemorySessionManager } from "../src/runtime/session/inMemorySessionManager";
 import { SessionRuntime } from "../src/runtime/session/sessionRuntime";
+import { SessionStore } from "../src/runtime/session/sessionStore";
 import { AgentSession } from "../src/runtime/session/types";
 
 class FakeSession implements AgentSession {
@@ -160,21 +161,25 @@ test("InMemorySessionManager discards persisted session whose lastUsedAt is olde
   withTempDir((dir) => {
     const logger = createLogger("error");
     const fileStore = new FileSessionStore(dir, "stale.json", logger);
-    // Stored 1000ms ago; timeout is 100ms — should be discarded.
-    fileStore.set("tg::chat::claude", "stale-resume", 1_000);
+    // Pre-create a session whose lastUsedAt is 1000ms; timeout is 100ms — should be skipped.
+    const sessionStore = new SessionStore(fileStore, () => 1_000);
+    sessionStore.createSession("tg::chat::claude", "sub-a", "Old conversation");
+    sessionStore.setResumeId("tg::chat::claude", "sub-a", "stale-resume");
 
     const manager = new InMemorySessionManager({
       logger,
       sessionTimeoutMs: 100,
       now: () => 5_000, // far past the stamped time
-      fileStore,
-      createSession: (channelId, chatId, agentName) =>
+      sessionStore: new SessionStore(fileStore, () => 5_000),
+      createSession: (channelId, chatId, _agentName) =>
         new FakeSession("fresh", channelId, chatId),
     });
 
     const session = manager.getOrCreate("tg", "chat", "claude") as FakeSession;
     assert.equal(session.wasRestoredFromDisk, false, "stale persisted session should not be restored");
-    assert.equal(fileStore.get("tg::chat::claude"), undefined, "stale entry should be evicted from disk");
+    // Metadata is preserved (user can still see it in /sessions); only the resume restore is skipped.
+    const meta = new SessionStore(fileStore).getActiveSession("tg::chat::claude");
+    assert.equal(meta?.sessionId, "sub-a", "session metadata should be preserved across idle reset");
   });
 });
 
@@ -182,14 +187,16 @@ test("InMemorySessionManager restores persisted session within idle window", () 
   withTempDir((dir) => {
     const logger = createLogger("error");
     const fileStore = new FileSessionStore(dir, "fresh.json", logger);
-    fileStore.set("tg::chat::claude", "fresh-resume", 4_950); // recent
+    const sessionStore = new SessionStore(fileStore, () => 4_950);
+    sessionStore.createSession("tg::chat::claude", "sub-b", "Recent conversation");
+    sessionStore.setResumeId("tg::chat::claude", "sub-b", "fresh-resume");
 
     const manager = new InMemorySessionManager({
       logger,
       sessionTimeoutMs: 100,
       now: () => 5_000,
-      fileStore,
-      createSession: (channelId, chatId, agentName) =>
+      sessionStore: new SessionStore(fileStore, () => 5_000),
+      createSession: (channelId, chatId, _agentName) =>
         new FakeSession("new-session-id", channelId, chatId),
     });
 
@@ -199,33 +206,149 @@ test("InMemorySessionManager restores persisted session within idle window", () 
   });
 });
 
-test("InMemorySessionManager.evictIdleSessions also deletes fileStore entries", () => {
+test("InMemorySessionManager.evictIdleSessions clears in-memory cache but preserves metadata", () => {
   withTempDir((dir) => {
     const logger = createLogger("error");
     const fileStore = new FileSessionStore(dir, "evict.json", logger);
 
     let now = 0;
+    const sessionStore = new SessionStore(fileStore, () => now);
+    sessionStore.createSession("tg::chat::claude", "sub-c", "Some session");
+
     const manager = new InMemorySessionManager({
       logger,
       sessionTimeoutMs: 100,
       now: () => now,
-      fileStore,
+      sessionStore,
       createSession: (channelId, chatId, agentName) =>
         new FakeSession(`sess-${agentName}`, channelId, chatId),
     });
 
     manager.getOrCreate("tg", "chat", "claude");
-    // Simulate persistence by directly setting the fileStore (SessionRuntime
-    // would do this after a successful send).
-    fileStore.set("tg::chat::claude", "persisted-id", now);
+    sessionStore.setResumeId("tg::chat::claude", "sub-c", "persisted-id");
 
-    // Advance time past idle threshold, then trigger eviction
+    // Advance time past idle threshold, then trigger eviction by touching a different store key
     now = 500;
+    sessionStore.createSession("tg::chat::other-agent", "sub-d", "Other session");
     manager.getOrCreate("tg", "chat", "other-agent");
 
-    assert.equal(fileStore.get("tg::chat::claude"), undefined,
-      "idle eviction should also delete the persisted resume ID");
+    // Metadata is preserved — only the live AgentSession instance is evicted.
+    const stillThere = sessionStore.getActiveSession("tg::chat::claude");
+    assert.equal(stillThere?.sessionId, "sub-c",
+      "idle eviction should only drop the in-memory AgentSession, not the session metadata");
+    assert.equal(stillThere?.meta.resumeId, "persisted-id",
+      "persisted resumeId stays so the user can reattach via /sessions");
   });
+});
+
+test("SessionRuntime marks the active sub-session broken when the runtime silently restarts", async () => {
+  await new Promise<void>(async (resolve, reject) => {
+    try {
+      const logger = createLogger("error");
+      const eventBus = new EventBus();
+
+      // Simulate the silent-retry behaviour: send() returns a different resumeId than the one set before.
+      const fakeSession: AgentSession = {
+        sessionId: "fake",
+        channelId: "tg",
+        chatId: "c",
+        async send(): Promise<string> {
+          (fakeSession as unknown as { _r?: string })._r = "post-send-id";
+          return "ok";
+        },
+        async close() {},
+        get resumeId(): string | undefined {
+          return (fakeSession as unknown as { _r?: string })._r;
+        },
+        setResumeId(id: string) {
+          (fakeSession as unknown as { _r?: string })._r = id;
+        },
+      };
+
+      const manager = {
+        getOrCreate: () => {
+          fakeSession.setResumeId!("pre-send-id");
+          return fakeSession;
+        },
+        close: async () => {},
+        closeAll: async () => {},
+      };
+
+      const dir = mkdtempSync(join(tmpdir(), "telegramable-broken-"));
+      try {
+        const fileStore = new FileSessionStore(dir, "x.json");
+        const sessionStore = new SessionStore(fileStore);
+        sessionStore.createSession("tg::c::claude", "sub", "test");
+
+        const runtime = new SessionRuntime(
+          { name: "claude", runtime: "session-claude", command: "claude" },
+          manager,
+          logger,
+          { sessionStore },
+        );
+
+        await runtime.execute({ channelId: "tg", chatId: "c", text: "hi" }, "exec", eventBus);
+
+        const meta = sessionStore.getActiveSession("tg::c::claude");
+        assert.equal(meta?.meta.broken, true);
+        assert.equal(meta?.meta.resumeId, "post-send-id");
+        resolve();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    } catch (e) {
+      reject(e);
+    }
+  });
+});
+
+test("SessionRuntime does NOT mark broken when there was no prior resumeId (fresh session)", async () => {
+  const logger = createLogger("error");
+  const eventBus = new EventBus();
+  const fakeSession: AgentSession = {
+    sessionId: "fake2",
+    channelId: "tg",
+    chatId: "c",
+    async send(): Promise<string> {
+      (fakeSession as unknown as { _r?: string })._r = "first-id";
+      return "ok";
+    },
+    async close() {},
+    get resumeId(): string | undefined {
+      return (fakeSession as unknown as { _r?: string })._r;
+    },
+    setResumeId(id: string) {
+      (fakeSession as unknown as { _r?: string })._r = id;
+    },
+  };
+
+  const manager = {
+    getOrCreate: () => fakeSession,
+    close: async () => {},
+    closeAll: async () => {},
+  };
+
+  const dir = mkdtempSync(join(tmpdir(), "telegramable-fresh-"));
+  try {
+    const fileStore = new FileSessionStore(dir, "x.json");
+    const sessionStore = new SessionStore(fileStore);
+    sessionStore.createSession("tg::c::claude", "sub", "test");
+
+    const runtime = new SessionRuntime(
+      { name: "claude", runtime: "session-claude", command: "claude" },
+      manager,
+      logger,
+      { sessionStore },
+    );
+
+    await runtime.execute({ channelId: "tg", chatId: "c", text: "hi" }, "exec", eventBus);
+
+    const meta = sessionStore.getActiveSession("tg::c::claude");
+    assert.notEqual(meta?.meta.broken, true);
+    assert.equal(meta?.meta.resumeId, "first-id");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("createRuntime keeps CLI runtime default and dispatches session runtime", () => {

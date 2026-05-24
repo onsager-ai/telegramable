@@ -10,6 +10,7 @@ import { FileSessionStore } from "./session/fileSessionStore";
 import { GeminiSession } from "./session/geminiSession";
 import { InMemorySessionManager } from "./session/inMemorySessionManager";
 import { SessionRuntime } from "./session/sessionRuntime";
+import { SessionStore } from "./session/sessionStore";
 import { Runtime } from "./types";
 
 export interface CreateRuntimeOptions {
@@ -41,11 +42,12 @@ export const createRuntime = (agent: AgentConfig, logger: Logger, options?: Crea
   }
 
   const fileStore = dataDir ? new FileSessionStore(dataDir, `${agent.runtime}-sessions.json`, logger) : undefined;
+  const sessionStore = fileStore ? new SessionStore(fileStore) : undefined;
 
   const sessionManager = new InMemorySessionManager({
     sessionTimeoutMs: agent.sessionTimeoutMs,
     logger,
-    fileStore,
+    sessionStore,
     createSession: (channelId, chatId) => {
       switch (agent.runtime) {
         case "session-claude":
@@ -61,7 +63,7 @@ export const createRuntime = (agent: AgentConfig, logger: Logger, options?: Crea
   });
 
   return new SessionRuntime(agent, sessionManager, logger, {
-    fileStore,
+    sessionStore,
     memoryProvider,
   });
 };
