@@ -437,10 +437,17 @@ interface RenderActivityState {
  *   …
  *   </blockquote>
  *
- * Running (no blockquote — keeps edit payloads short and avoids Telegram's
- * "blockquote does not collapse under ~4 lines" footgun):
+ * Running: completed steps stay visible with ✓ inside an expandable
+ * blockquote; the current step is rendered below the blockquote with ▸
+ * so it stays visible even when the blockquote is collapsed. This keeps
+ * the message append-only as steps complete (no flashing on edit).
  *   ⚙️ <b>Working</b> · <i>3 steps</i>
- *   ⚡1 📖1 · ▸ <b>Edit</b> <code>hub.ts</code>
+ *   ⚡1 📖1
+ *   <blockquote expandable>
+ *   ✓ <b>Read</b> <code>hub.ts</code> (1790 lines)
+ *   ✓ <b>Bash</b> <code>ls</code> (5 lines)
+ *   </blockquote>
+ *   ▸ <b>Edit</b> <code>hub.ts</code>
  *
  * Error: like Done, plus `<i>{reason}</i>` between counter and blockquote;
  * the failing (last) step row is prefixed `✗` instead of `✓`.
@@ -463,30 +470,9 @@ export const renderActivity = (state: RenderActivityState): string => {
 
   const lines: string[] = [header];
 
-  // Counter line + (running only) ▸ current
+  // Counter line
   if (total > 0) {
-    const counters = formatCategoryCounters(visibleTools);
-    if (state.status === "running") {
-      const lastTool = visibleTools[visibleTools.length - 1];
-      // Bash commands can be long (heredocs, jq pipelines, npm/docker invocations)
-      // and overrun mobile widths when rendered inline. Move the command body
-      // into an expandable <blockquote><pre> so ≥4-line commands collapse and
-      // shorter ones stay visually contained inside the quote.
-      if (categorizeToolName(lastTool.name) === "bash") {
-        const { name, arg } = formatToolDisplay(lastTool.name, lastTool.input);
-        lines.push(`${counters} · ▸ <b>${escapeHtml(name)}</b>`);
-        if (arg) {
-          lines.push(
-            `<blockquote expandable><pre><code class="language-bash">${escapeHtml(arg)}</code></pre></blockquote>`,
-          );
-        }
-      } else {
-        const currentDesc = formatToolDescription(lastTool.name, lastTool.input);
-        lines.push(`${counters} · ▸ ${currentDesc}`);
-      }
-    } else {
-      lines.push(counters);
-    }
+    lines.push(formatCategoryCounters(visibleTools));
   }
 
   // Error reason between counters and blockquote
@@ -494,30 +480,36 @@ export const renderActivity = (state: RenderActivityState): string => {
     lines.push(`<i>${escapeHtml(state.errorReason)}</i>`);
   }
 
-  // Running state: skip blockquote entirely. The `▸ current` cue on the
-  // counter line already covers "what's happening now"; past steps will
-  // appear in the Done summary once the run finishes.
-  if (state.status === "running") {
+  if (total === 0) {
     return lines.join("\n");
   }
 
-  // Dedup-consecutive step list inside an expandable blockquote.
+  // During running, peel off the last tool as the "current" step — it renders
+  // below the blockquote so it stays visible if the blockquote collapses.
+  // Past steps (✓/✗) stay grouped inside the expandable blockquote.
+  const isRunning = state.status === "running";
+  const pastTools = isRunning ? visibleTools.slice(0, -1) : visibleTools;
+  const currentTool = isRunning ? visibleTools[visibleTools.length - 1] : undefined;
+
+  // Dedup-consecutive step list for past tools, inside an expandable blockquote.
   // Each row carries: prefix (✓ / ✗), the unified body, optional suffix
   // describing the tool's result.
-  if (total > 0) {
+  if (pastTools.length > 0) {
     type Row = { body: string; count: number; isSubagent?: boolean; prefix: string };
     const deduped: Row[] = [];
 
-    for (let i = 0; i < visibleTools.length; i++) {
-      const tool = visibleTools[i];
+    for (let i = 0; i < pastTools.length; i++) {
+      const tool = pastTools[i];
       const desc = formatToolDescription(tool.name, tool.input);
       const suffix = formatToolResultSuffix(tool.name, tool.result);
       const bashFailed =
         categorizeToolName(tool.name) === "bash" && tool.result?.isError === true;
-      const isLast = i === visibleTools.length - 1;
       // ✗ for the failing step (the last step of an Error-state run, or any
-      // bash step whose result reported an error). Everything else is ✓.
-      const isFailing = (state.status === "error" && isLast) || bashFailed;
+      // bash step whose result reported an error). Past steps in a running
+      // run are all completed, so the error-state-last-step rule only applies
+      // when status is "error".
+      const isLastOverall = !isRunning && i === pastTools.length - 1;
+      const isFailing = (state.status === "error" && isLastOverall) || bashFailed;
       const prefix = isFailing ? "✗" : "✓";
       const body = suffix ? `${desc} ${escapeHtml(suffix)}` : desc;
 
@@ -545,6 +537,26 @@ export const renderActivity = (state: RenderActivityState): string => {
       blockquoteLines.push(`<i>… (${more} more, /logs ${state.executionId} for full)</i>`);
     }
     lines.push(`<blockquote expandable>${blockquoteLines.join("\n")}</blockquote>`);
+  }
+
+  // Current step (running only) — below the past-steps blockquote so it
+  // stays visible while the blockquote may collapse. Long Bash commands
+  // get an expandable <pre> wrapper so heredocs/jq pipelines don't overrun
+  // mobile widths.
+  if (currentTool) {
+    const sub = currentTool.isSubagent ? "↳ " : "";
+    if (categorizeToolName(currentTool.name) === "bash") {
+      const { name, arg } = formatToolDisplay(currentTool.name, currentTool.input);
+      lines.push(`▸ ${sub}<b>${escapeHtml(name)}</b>`);
+      if (arg) {
+        lines.push(
+          `<blockquote expandable><pre><code class="language-bash">${escapeHtml(arg)}</code></pre></blockquote>`,
+        );
+      }
+    } else {
+      const currentDesc = formatToolDescription(currentTool.name, currentTool.input);
+      lines.push(`▸ ${sub}${currentDesc}`);
+    }
   }
 
   return lines.join("\n");
