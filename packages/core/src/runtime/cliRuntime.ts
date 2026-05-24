@@ -13,6 +13,7 @@ import { MemoryProvider } from "../memory/provider";
 import { TelegramMemoryProvider } from "../memory/telegramProvider";
 import { Runtime } from "./types";
 import { FileSessionStore } from "./session/fileSessionStore";
+import { SessionStore, UNTITLED } from "./session/sessionStore";
 
 export interface CliRuntimeOptions {
   dataDir?: string;
@@ -39,6 +40,15 @@ export class CliRuntime implements Runtime {
   /** Live child processes — tracked so graceful shutdown can SIGTERM them. */
   private readonly activeChildren = new Set<ChildProcess>();
   private readonly fileStore?: FileSessionStore;
+  /**
+   * Multi-session store, present when `dataDir` is configured. Exposed on the
+   * Runtime interface so the hub can drive `/sessions`, `/new`, etc.
+   *
+   * When undefined (no `dataDir`), the runtime falls back to a single in-process
+   * session per `(channelId, chatId)` slot with no persistence — see `sessions`
+   * below.
+   */
+  readonly sessionStore?: SessionStore;
   private readonly getSystemPromptSuffix?: () => string;
   private readonly memoryProvider?: MemoryProvider;
   private readonly useAgentDrivenMemory: boolean;
@@ -71,9 +81,16 @@ export class CliRuntime implements Runtime {
     return this.config.outputFormat ?? "stream-json";
   }
 
+  /** Agent name exposed on the Runtime interface — used by hub to build the SessionStore key. */
+  get agentName(): string {
+    return this.config.name;
+  }
+
   constructor(private readonly config: AgentConfig, private readonly logger: Logger, options?: CliRuntimeOptions) {
     if (options?.dataDir) {
       this.fileStore = new FileSessionStore(options.dataDir, "cli-sessions.json", logger);
+      this.migrateLegacyKeys(this.fileStore);
+      this.sessionStore = new SessionStore(this.fileStore);
     }
     this.getSystemPromptSuffix = options?.getSystemPromptSuffix;
     this.memoryProvider = options?.memoryProvider;
@@ -90,6 +107,34 @@ export class CliRuntime implements Runtime {
     }
     if (config.disallowedTools?.length) {
       this.logger.warn("CLI runtime ignores DISALLOWED_TOOLS — bypassPermissions approves all tools.", { tools: config.disallowedTools });
+    }
+  }
+
+  /**
+   * Migrate pre-multi-session entries in `cli-sessions.json` from the legacy
+   * 2-part key `${channelId}::${chatId}` to the 3-part `${channelId}::${chatId}::${agentName}`
+   * expected by `SessionStore`. Without this, an upgrade would silently orphan
+   * every existing user's Claude session.
+   *
+   * Detection is purely structural: any key with fewer than two `::` separators
+   * is legacy. We don't know which agent owned a legacy entry (the old file was
+   * shared across all cli agents), so we attribute them to this runtime's agent
+   * — a safe choice in the common single-cli-agent setup and harmless in the
+   * multi-agent case (the orphaned key would have been overwritten anyway by
+   * whichever agent ran last).
+   */
+  private migrateLegacyKeys(store: FileSessionStore): void {
+    for (const key of store.keys()) {
+      const parts = key.split("::");
+      if (parts.length >= 3) continue; // already 3-part (agent name appended)
+      const newKey = `${key}::${this.config.name}`;
+      if (store.rename(key, newKey)) {
+        this.logger.info("Migrated legacy cli-sessions entry to multi-session key.", {
+          from: key,
+          to: newKey,
+          agent: this.config.name,
+        });
+      }
     }
   }
 
@@ -364,27 +409,72 @@ export class CliRuntime implements Runtime {
 
     return new Promise((resolve, reject) => {
       const sessionKey = `${message.channelId}::${message.chatId}`;
+      const storeKey = `${message.channelId}::${message.chatId}::${this.config.name}`;
 
-      // Idle reset: if the last turn for this key happened more than
-      // sessionTimeoutMs ago, treat the persisted session as expired and
-      // start fresh. The in-process map wins when populated (handles same-
-      // process reuse without disk I/O); we fall back to the persisted
-      // lastUsedAt across restarts. Skipped on retry — the retry path is
-      // already starting a fresh session by design.
+      // Resolve which Claude CLI session to attach to.
+      //   - `existingSessionId` → drives `--resume` (continues a prior conversation)
+      //   - `freshSessionId`    → drives `--session-id` (starts a brand-new conversation)
+      // Exactly one is populated per call. The retry path always takes the fresh
+      // branch by design (the stale-resume retry below sets up state for it).
+      //
+      // Two storage paths coexist:
+      //   - `sessionStore` (multi-session, persisted) when `dataDir` is configured.
+      //     The hub drives `/sessions`, `/new`, etc. against this store. The Claude
+      //     CLI session id is mirrored as the sub-session's `resumeId` AND its own
+      //     `sessionId` (we use one UUID for both, see below).
+      //   - In-memory-only `sessions` Map when `dataDir` is absent (CLI invocation,
+      //     tests). Single session per `(channelId, chatId)`, no persistence.
       let existingSessionId: string | undefined;
-      if (!isRetry) {
-        const inMemoryId = this.sessions.get(sessionKey);
-        const persisted = this.fileStore?.get(sessionKey);
-        const lastUsedAt = this.sessionLastUsedAt.get(sessionKey) ?? persisted?.lastUsedAt ?? 0;
-        const idleMs = Date.now() - lastUsedAt;
+      let freshSessionId: string | undefined;
+      let activeSubId: string | undefined;
 
-        if ((inMemoryId || persisted) && idleMs > this.sessionTimeoutMs) {
-          this.logger.info("Resetting idle CLI session.", { sessionKey, idleMs, sessionTimeoutMs: this.sessionTimeoutMs });
-          this.sessions.delete(sessionKey);
-          this.fileStore?.delete(sessionKey);
-          this.sessionLastUsedAt.delete(sessionKey);
-        } else {
-          existingSessionId = inMemoryId || persisted?.id;
+      if (this.sessionStore) {
+        // Multi-session path. The hub's `ensureActiveSession` normally pre-creates
+        // the active sub-session before dispatch, but direct-runtime callers
+        // (cli app, tests) bypass that — so lazy-create here on first turn.
+        let active = this.sessionStore.getActiveSession(storeKey);
+        if (!active && !isRetry) {
+          const newId = randomUUID();
+          this.sessionStore.createSession(storeKey, newId, UNTITLED);
+          active = this.sessionStore.getActiveSession(storeKey);
+        }
+
+        if (active) {
+          activeSubId = active.sessionId;
+          const lastUsedAt = active.meta.lastUsedAt ?? 0;
+          const idleMs = lastUsedAt > 0 ? Date.now() - lastUsedAt : Infinity;
+          const canResume =
+            !isRetry &&
+            !!active.meta.resumeId &&
+            !active.meta.broken &&
+            idleMs <= this.sessionTimeoutMs;
+
+          if (canResume) {
+            existingSessionId = active.meta.resumeId;
+          } else {
+            if (!isRetry && active.meta.resumeId && idleMs > this.sessionTimeoutMs) {
+              this.logger.info("Resetting idle CLI session.", { storeKey, idleMs, sessionTimeoutMs: this.sessionTimeoutMs });
+            }
+            // Reuse the sub-session's own UUID as the Claude `--session-id` value so
+            // `resumeId === sessionId` — saves a UUID and keeps the mapping trivial.
+            freshSessionId = active.sessionId;
+          }
+        }
+      } else {
+        // In-memory-only path. No persistence, no multi-session — one current
+        // session per `(channelId, chatId)`, reset on idle.
+        if (!isRetry) {
+          const inMemoryId = this.sessions.get(sessionKey);
+          const lastUsedAt = this.sessionLastUsedAt.get(sessionKey) ?? 0;
+          const idleMs = Date.now() - lastUsedAt;
+
+          if (inMemoryId && idleMs > this.sessionTimeoutMs) {
+            this.logger.info("Resetting idle CLI session.", { sessionKey, idleMs, sessionTimeoutMs: this.sessionTimeoutMs });
+            this.sessions.delete(sessionKey);
+            this.sessionLastUsedAt.delete(sessionKey);
+          } else {
+            existingSessionId = inMemoryId;
+          }
         }
       }
 
@@ -405,18 +495,24 @@ export class CliRuntime implements Runtime {
       const sessionStartedAt = Date.now();
       if (existingSessionId) {
         args.push("--resume", existingSessionId);
-        // Ensure in-memory map is populated (may have been loaded from file store)
-        this.sessions.set(sessionKey, existingSessionId);
-        this.sessionLastUsedAt.set(sessionKey, sessionStartedAt);
-        // Refresh the persisted timestamp so idle eviction tracks the latest
-        // observed activity, not the very first time this session was created.
-        this.fileStore?.set(sessionKey, existingSessionId, sessionStartedAt);
+        if (this.sessionStore && activeSubId) {
+          // Refresh `lastUsedAt` proactively so concurrent reads see we're active.
+          this.sessionStore.touchLastUsed(storeKey, activeSubId);
+        } else {
+          this.sessions.set(sessionKey, existingSessionId);
+          this.sessionLastUsedAt.set(sessionKey, sessionStartedAt);
+        }
       } else {
-        const newSessionId = randomUUID();
-        this.sessions.set(sessionKey, newSessionId);
-        this.sessionLastUsedAt.set(sessionKey, sessionStartedAt);
-        this.fileStore?.set(sessionKey, newSessionId, sessionStartedAt);
+        const newSessionId = freshSessionId ?? randomUUID();
         args.push("--session-id", newSessionId);
+        if (this.sessionStore && activeSubId) {
+          // Pre-record the resumeId — first turn's --session-id IS the future resume id.
+          this.sessionStore.setResumeId(storeKey, activeSubId, newSessionId);
+          this.sessionStore.touchLastUsed(storeKey, activeSubId);
+        } else {
+          this.sessions.set(sessionKey, newSessionId);
+          this.sessionLastUsedAt.set(sessionKey, sessionStartedAt);
+        }
       }
 
       // Pass prompt as a positional argument (after "--" to prevent flag interpretation).
@@ -656,9 +752,16 @@ export class CliRuntime implements Runtime {
             exitCode: code,
             stderr: stderr.slice(0, 1000) || undefined
           });
-          this.sessions.delete(sessionKey);
-          this.fileStore?.delete(sessionKey);
-          this.sessionLastUsedAt.delete(sessionKey);
+          if (this.sessionStore && activeSubId) {
+            // Mark the sub-session broken so the user sees ⚠ in /sessions and a
+            // subsequent /new is required to recover. The retry below (if any)
+            // creates a fresh sub-session immediately so this turn still gets a
+            // chance to complete.
+            this.sessionStore.markBroken(storeKey, activeSubId);
+          } else {
+            this.sessions.delete(sessionKey);
+            this.sessionLastUsedAt.delete(sessionKey);
+          }
 
           // If this was a resumed session that failed because the conversation
           // no longer exists, transparently retry with a fresh session. Emit a
@@ -670,6 +773,10 @@ export class CliRuntime implements Runtime {
           if (existingSessionId && !isRetry && /no conversation found/i.test(stderr)) {
             if (mcpFiles) this.cleanupMcpFiles(mcpFiles.mcpDir, mcpFiles.mcpConfigPath, mcpFiles.stateFilePath);
             this.logger.info("Retrying with fresh session after stale resume ID.", { executionId, staleSessionId: existingSessionId });
+            if (this.sessionStore) {
+              // Create a new active sub-session for the retry to take over.
+              this.sessionStore.createSession(storeKey, randomUUID(), UNTITLED);
+            }
             eventBus.emit({
               executionId,
               channelId: message.channelId,

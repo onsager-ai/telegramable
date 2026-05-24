@@ -2101,7 +2101,7 @@ export class ChannelHub {
     if (command.type === "new") {
       const ctx = this.resolveSessionContext(message);
       if (!ctx) {
-        await adapter.sendMessage(message.chatId, "Sessions not available for this agent.");
+        await adapter.sendMessage(message.chatId, "Sessions are not persisted for this agent. Set <code>DATA_DIR</code> in the environment to enable /new and /sessions.");
         return;
       }
       ctx.store.createSession(ctx.storeKey, randomUUID(), UNTITLED);
@@ -2118,7 +2118,7 @@ export class ChannelHub {
         ? "<i>⚠ /list is deprecated — use /sessions</i>\n\n"
         : "";
       if (!ctx) {
-        await adapter.sendMessage(message.chatId, `${deprecationHint}Sessions not available for this agent.`);
+        await adapter.sendMessage(message.chatId, `${deprecationHint}Sessions are not persisted for this agent. Set <code>DATA_DIR</code> in the environment to enable /new and /sessions.`);
         return;
       }
       const value = ctx.store.getValue(ctx.storeKey);
