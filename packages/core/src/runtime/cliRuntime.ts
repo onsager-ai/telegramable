@@ -14,6 +14,7 @@ import { TelegramMemoryProvider } from "../memory/telegramProvider";
 import { Runtime } from "./types";
 import { FileSessionStore } from "./session/fileSessionStore";
 import { SessionStore, UNTITLED } from "./session/sessionStore";
+import type { UsageDelta } from "../events/types";
 
 export interface CliRuntimeOptions {
   dataDir?: string;
@@ -1113,7 +1114,24 @@ export class CliRuntime implements Runtime {
       return;
     }
 
-    // "result" type is handled by the close event — ignore here.
+    // "result" type carries the final response text (handled by the close-event
+    // path that calls extractResultFromStreamJson), and also the per-turn token
+    // + cost numbers — surfaced here as a `usage` event so the hub's UsageStore
+    // can accumulate them for /usage.
+    if (type === "result") {
+      const delta = parseClaudeUsage(parsed);
+      if (delta) {
+        eventBus.emit({
+          executionId,
+          channelId: message.channelId,
+          chatId: message.chatId,
+          type: "usage",
+          timestamp: Date.now(),
+          payload: { agentName: this.config.name, usage: delta },
+        });
+      }
+      return;
+    }
     // "system" events (api_retry, etc.) are logged but not forwarded.
     if (type === "system") {
       this.logger.info("CLI stream-json system event.", { executionId, subtype: (parsed as Record<string, unknown>).subtype });
@@ -1169,6 +1187,30 @@ export class CliRuntime implements Runtime {
       });
     }
   }
+}
+
+/**
+ * Pull `usage` + `total_cost_usd` off a Claude CLI `result` event.
+ *
+ * Shape (Claude Code, stream-json):
+ *   { type: "result", usage: { input_tokens, output_tokens,
+ *     cache_creation_input_tokens, cache_read_input_tokens }, total_cost_usd }
+ *
+ * Returns null when the event lacks usage entirely (e.g. non-Claude binaries
+ * piggybacking on cli runtime). Missing individual fields are coerced to 0 so
+ * downstream sums stay numeric.
+ */
+export function parseClaudeUsage(evt: Record<string, unknown>): UsageDelta | null {
+  const usage = evt.usage as Record<string, unknown> | undefined;
+  const cost = evt.total_cost_usd;
+  if (!usage && typeof cost !== "number") return null;
+  const num = (v: unknown): number => (typeof v === "number" ? v : 0);
+  return {
+    inputTokens: num(usage?.input_tokens),
+    outputTokens: num(usage?.output_tokens),
+    cacheTokens: num(usage?.cache_creation_input_tokens) + num(usage?.cache_read_input_tokens),
+    costUsd: num(cost),
+  };
 }
 
 /**

@@ -12,7 +12,16 @@ export type ExecutionEventType =
   | "tool-use"
   | "thinking"
   | "turn-complete"
-  | "retry-reset";
+  | "retry-reset"
+  | "usage";
+
+/** Token + cost numbers parsed from a runtime's per-turn `result` event. */
+export interface UsageDelta {
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+  costUsd: number;
+}
 
 /** Result of a tool execution, paired to a tool-use by toolUseId. */
 export interface ToolResult {
@@ -58,5 +67,9 @@ export interface ExecutionEvent {
 
     // turn-complete fields: user's original prompt for memory worker snapshots
     userText?: string;
+
+    // usage event: per-turn token + cost numbers from the runtime's result event.
+    // agentName carries the agent name so the hub can scope the UsageStore key.
+    usage?: UsageDelta;
   };
 }

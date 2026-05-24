@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import { AgentConfig } from "../../config";
 import { EventBus } from "../../events/eventBus";
+import { parseClaudeUsage } from "../cliRuntime";
 import { NativeSessionState, AgentSession } from "./types";
 import { NdjsonRunner, spawnAndStreamNdjson } from "./utils";
 
@@ -121,6 +122,17 @@ export class ClaudeSession implements AgentSession {
               ...(resultIsError ? { reason: "error" } : {})
             }
           });
+          const delta = parseClaudeUsage(evt as unknown as Record<string, unknown>);
+          if (delta) {
+            eventBus.emit({
+              executionId,
+              channelId: this.channelId,
+              chatId: this.chatId,
+              type: "usage",
+              timestamp: Date.now(),
+              payload: { agentName: this.config.name, usage: delta },
+            });
+          }
           return;
         }
 
