@@ -5,7 +5,7 @@ import {
   buildSessionsListMarkup,
   parseSessionsCallback,
 } from "../src/hub/sessionsMarkup";
-import { SessionMeta } from "../src/runtime/session/sessionStore";
+import { SessionMeta, UNTITLED } from "../src/runtime/session/sessionStore";
 
 const meta = (overrides: Partial<SessionMeta> = {}): SessionMeta => ({
   title: "Untitled session",
@@ -14,13 +14,14 @@ const meta = (overrides: Partial<SessionMeta> = {}): SessionMeta => ({
   ...overrides,
 });
 
-test("buildSessionsListMarkup renders empty state with no buttons", () => {
+test("buildSessionsListMarkup renders empty state with a single + New button", () => {
   const { text, markup } = buildSessionsListMarkup(undefined, []);
   assert.ok(text.includes("No sessions yet"));
-  assert.deepEqual(markup.inline_keyboard, []);
+  assert.equal(markup.inline_keyboard.length, 1);
+  assert.equal(markup.inline_keyboard[0][0].callback_data, "sess:new");
 });
 
-test("buildSessionsListMarkup marks the active session and omits its button", () => {
+test("buildSessionsListMarkup marks the active session and adds Rename + New control buttons", () => {
   const now = 60_000;
   const { text, markup } = buildSessionsListMarkup(
     "s1",
@@ -28,10 +29,25 @@ test("buildSessionsListMarkup marks the active session and omits its button", ()
     { now },
   );
   assert.ok(text.includes("→ <b>Hello</b>"));
-  assert.deepEqual(markup.inline_keyboard, []);
+  // No Switch button on the active row — only the always-on control row at the bottom.
+  assert.equal(markup.inline_keyboard.length, 1);
+  const controlRow = markup.inline_keyboard[0];
+  assert.equal(controlRow.length, 2);
+  assert.equal(controlRow[0].callback_data, "sess:rename:s1");
+  assert.equal(controlRow[1].callback_data, "sess:new");
 });
 
-test("buildSessionsListMarkup renders [Switch] for non-active rows", () => {
+test("buildSessionsListMarkup renders an italic placeholder for UNTITLED sessions", () => {
+  const { text } = buildSessionsListMarkup(
+    "s1",
+    [{ sessionId: "s1", meta: meta({ title: UNTITLED, lastUsedAt: 1_000 }) }],
+    { now: 1_000 },
+  );
+  assert.ok(text.includes("New session · awaiting first message"));
+  assert.ok(!text.includes("Untitled session"));
+});
+
+test("buildSessionsListMarkup renders [Switch] for non-active rows plus a control row", () => {
   const now = 60_000;
   const { text, markup } = buildSessionsListMarkup(
     "s1",
@@ -43,11 +59,14 @@ test("buildSessionsListMarkup renders [Switch] for non-active rows", () => {
   );
   assert.ok(text.includes("→ <b>Active one</b>"));
   assert.ok(text.includes("Other"));
-  assert.equal(markup.inline_keyboard.length, 1);
+  // 1 Switch row for s2 + 1 control row (Rename active + New)
+  assert.equal(markup.inline_keyboard.length, 2);
   assert.equal(markup.inline_keyboard[0][0].callback_data, "sess:switch:s2");
+  assert.equal(markup.inline_keyboard[1][0].callback_data, "sess:rename:s1");
+  assert.equal(markup.inline_keyboard[1][1].callback_data, "sess:new");
 });
 
-test("buildSessionsListMarkup renders broken rows as strikethrough with no button", () => {
+test("buildSessionsListMarkup renders broken rows as strikethrough with no Switch button", () => {
   const { text, markup } = buildSessionsListMarkup(
     "s1",
     [
@@ -58,8 +77,9 @@ test("buildSessionsListMarkup renders broken rows as strikethrough with no butto
   );
   assert.ok(text.includes("<s>Dead session</s>"));
   assert.ok(text.includes("broken"));
-  // Only one keyboard row would have been added (for s2) without the broken guard.
-  assert.equal(markup.inline_keyboard.length, 0);
+  // Broken sessions get no row, so only the control row remains.
+  assert.equal(markup.inline_keyboard.length, 1);
+  assert.equal(markup.inline_keyboard[0][0].callback_data, "sess:rename:s1");
 });
 
 test("buildSessionsListMarkup caps at 10 rows and shows overflow hint", () => {
@@ -69,8 +89,9 @@ test("buildSessionsListMarkup caps at 10 rows and shows overflow hint", () => {
   }));
   const { text, markup } = buildSessionsListMarkup(undefined, sessions, { now: 2_000 });
   assert.ok(text.includes("3 older"));
-  // 10 non-active rows, all get [Switch]
-  assert.equal(markup.inline_keyboard.length, 10);
+  // 10 non-active rows (no active set) all get [Switch], plus the bottom + New row.
+  assert.equal(markup.inline_keyboard.length, 11);
+  assert.equal(markup.inline_keyboard[10][0].callback_data, "sess:new");
 });
 
 test("buildSessionsListMarkup escapes HTML in titles", () => {
@@ -89,9 +110,20 @@ test("parseSessionsCallback round-trips the switch action", () => {
   assert.deepEqual(parsed, { type: "switch", sessionId: "abc-123" });
 });
 
+test("parseSessionsCallback round-trips the rename action", () => {
+  const parsed = parseSessionsCallback(`${SESSIONS_CALLBACK_PREFIX}rename:abc-123`);
+  assert.deepEqual(parsed, { type: "rename", sessionId: "abc-123" });
+});
+
+test("parseSessionsCallback round-trips the new action", () => {
+  const parsed = parseSessionsCallback(`${SESSIONS_CALLBACK_PREFIX}new`);
+  assert.deepEqual(parsed, { type: "new" });
+});
+
 test("parseSessionsCallback returns null for malformed input", () => {
   assert.equal(parseSessionsCallback("not-ours:foo"), null);
   assert.equal(parseSessionsCallback("sess:"), null);
   assert.equal(parseSessionsCallback("sess:switch:"), null);
+  assert.equal(parseSessionsCallback("sess:rename:"), null);
   assert.equal(parseSessionsCallback("sess:unknown:abc"), null);
 });

@@ -102,11 +102,14 @@ function buildHub(dir: string, opts: BuildOptions = {}): BuildResult {
 
 // --- parser ---
 
-test("parseBuiltinCommand parses /new, /sessions, /stop, /usage", () => {
+test("parseBuiltinCommand parses /new, /sessions, /stop, /usage, /rename", () => {
   assert.deepEqual(parseBuiltinCommand("/new"), { type: "new" });
   assert.deepEqual(parseBuiltinCommand(" /sessions  "), { type: "sessions" });
   assert.deepEqual(parseBuiltinCommand("/STOP"), { type: "stop" });
   assert.deepEqual(parseBuiltinCommand("/usage"), { type: "usage" });
+  assert.deepEqual(parseBuiltinCommand("/rename Weekend trip"), { type: "rename", title: "Weekend trip" });
+  assert.deepEqual(parseBuiltinCommand("/RENAME  multi word title  "), { type: "rename", title: "multi word title" });
+  assert.equal(parseBuiltinCommand("/rename"), null); // no title → not a valid rename
 });
 
 // --- lazy session creation + title backfill ---
@@ -181,8 +184,11 @@ test("/sessions lists sessions with Switch buttons for non-active rows", withHub
   assert.ok(msg.text.includes("→ <b>beta</b>"), "second session is active");
   const buttons = (msg.markup as { inline_keyboard: Array<Array<{ callback_data: string }>> })
     .inline_keyboard.flat();
-  assert.equal(buttons.length, 1, "one Switch button for the non-active session");
-  assert.ok(buttons[0].callback_data.startsWith("sess:switch:"));
+  // 1 Switch button (for the non-active alpha) + Rename + New control buttons.
+  assert.equal(buttons.length, 3);
+  assert.ok(buttons.some((b) => b.callback_data.startsWith("sess:switch:")));
+  assert.ok(buttons.some((b) => b.callback_data.startsWith("sess:rename:")));
+  assert.ok(buttons.some((b) => b.callback_data === "sess:new"));
 }));
 
 test("/list is a deprecated alias that prepends a deprecation hint", withHub(async ({ adapter }) => {
@@ -235,6 +241,55 @@ test("sess:switch:<id> on a broken session shows 'Session unavailable.'", withHu
 
   assert.ok(adapter.answeredCallbacks.some((c) => c.text === "Session unavailable."));
   assert.notEqual(sessionStore.getActiveSession("telegram::chat-1::claude")!.sessionId, firstId);
+}));
+
+// --- /rename + rename callback ---
+
+test("/rename retitles the active session and confirms in chat", withHub(async ({ adapter, sessionStore }) => {
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "hello there" });
+  await sleep(30);
+  const before = sessionStore.getActiveSession("telegram::chat-1::claude")!;
+  assert.equal(before.meta.title, "hello there");
+
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "/rename Weekend planning" });
+  await sleep(30);
+
+  const after = sessionStore.getActiveSession("telegram::chat-1::claude")!;
+  assert.equal(after.sessionId, before.sessionId, "rename preserves the active session id");
+  assert.equal(after.meta.title, "Weekend planning");
+  assert.ok(adapter.sentMessages.some((m) => m.text.includes("Renamed to:")));
+}));
+
+test("/rename without an active session tells the user to start one first", withHub(async ({ adapter }) => {
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "/rename Something" });
+  await sleep(30);
+  assert.ok(adapter.sentMessages.some((m) => m.text.includes("No active session to rename")));
+}));
+
+test("sess:new callback creates a fresh session and refreshes the list message", withHub(async ({ adapter, sessionStore }) => {
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "first" });
+  await sleep(30);
+  const firstId = sessionStore.getActiveSession("telegram::chat-1::claude")!.sessionId;
+
+  await adapter.simulateCallback("chat-1", "sess:new", 100);
+  await sleep(30);
+
+  const newActive = sessionStore.getActiveSession("telegram::chat-1::claude")!;
+  assert.notEqual(newActive.sessionId, firstId, "+ New button should switch active to a fresh session");
+  assert.equal(newActive.meta.title, UNTITLED);
+  assert.ok(adapter.answeredCallbacks.some((c) => c.text === "Started a new session."));
+}));
+
+test("sess:rename callback acks with the command hint when the row is active", withHub(async ({ adapter, sessionStore }) => {
+  await adapter.simulateIncoming({ channelId: "telegram", chatId: "chat-1", text: "hello" });
+  await sleep(30);
+  const activeId = sessionStore.getActiveSession("telegram::chat-1::claude")!.sessionId;
+
+  await adapter.simulateCallback("chat-1", `sess:rename:${activeId}`, 101);
+  await sleep(30);
+
+  assert.ok(adapter.answeredCallbacks.some((c) => c.text?.includes("/rename")));
+  assert.ok(adapter.sentMessages.some((m) => m.text.includes("/rename")));
 }));
 
 // --- /usage and /stop stubs ---

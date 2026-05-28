@@ -80,6 +80,7 @@ type BuiltinCommand =
   | { type: "sessions" }
   | { type: "stop" }
   | { type: "usage" }
+  | { type: "rename"; title: string }
   | { type: "memory" }
   | { type: "memory-search"; query: string }
   | { type: "memory-edit"; id: string; text: string }
@@ -116,6 +117,11 @@ export const parseBuiltinCommand = (text: string): BuiltinCommand => {
   if (/^\/sessions\s*$/i.test(trimmed)) return { type: "sessions" };
   if (/^\/stop\s*$/i.test(trimmed))     return { type: "stop" };
   if (/^\/usage\s*$/i.test(trimmed))    return { type: "usage" };
+
+  const renameMatch = trimmed.match(/^\/rename\s+(.+)$/i);
+  if (renameMatch?.[1]) {
+    return { type: "rename", title: renameMatch[1].trim() };
+  }
 
   if (/^\/list\s*$/i.test(trimmed)) {
     return { type: "list" };
@@ -1125,6 +1131,43 @@ export class ChannelHub {
         await adapter.editMessageWithMarkup(message.chatId, message.messageId, text, markup).catch(() => {});
       }
       await adapter.sendMessage(message.chatId, `Switched to: <b>${titleText}</b>`);
+      return;
+    }
+
+    if (parsed.type === "new") {
+      ctx.store.createSession(ctx.storeKey, randomUUID(), UNTITLED);
+      await ack("Started a new session.");
+      if (adapter.editMessageWithMarkup && message.messageId) {
+        const value = ctx.store.getValue(ctx.storeKey);
+        const sessions = ctx.store.listSessions(ctx.storeKey);
+        const { text, markup } = buildSessionsListMarkup(value?.active, sessions);
+        await adapter.editMessageWithMarkup(message.chatId, message.messageId, text, markup).catch(() => {});
+      } else {
+        await adapter.sendMessage(message.chatId, "Started a new session.");
+      }
+      return;
+    }
+
+    if (parsed.type === "rename") {
+      // Inline keyboards can't open an input prompt — we ack with the command
+      // the user should type. Once force_reply is wired in the adapter we can
+      // upgrade this to an inline reply prompt.
+      const value = ctx.store.getValue(ctx.storeKey);
+      const target = value?.sessions[parsed.sessionId];
+      if (!target || target.broken) {
+        await ack("Session unavailable.");
+        return;
+      }
+      if (parsed.sessionId !== value?.active) {
+        await ack("Switch to the session first, then rename.");
+        return;
+      }
+      await ack("Type /rename <new title>");
+      await adapter.sendMessage(
+        message.chatId,
+        `✎ Rename the active session: send <code>/rename &lt;new title&gt;</code>.`,
+      );
+      return;
     }
   }
 
@@ -2111,6 +2154,7 @@ export class ChannelHub {
         "",
         "🆕 /new — start a new session (current one preserved in /sessions)",
         "📋 /sessions — list and switch sessions",
+        "✎ /rename &lt;title&gt; — rename the active session",
         "⏹ /stop — cancel the running task",
         "",
         "🧠 /memory — view and manage stored memories",
@@ -2138,6 +2182,23 @@ export class ChannelHub {
         message.chatId,
         "Started a new session. Switch back anytime via /sessions.",
       );
+      return;
+    }
+
+    if (command.type === "rename") {
+      const ctx = this.resolveSessionContext(message);
+      if (!ctx) {
+        await adapter.sendMessage(message.chatId, "Sessions are not persisted for this agent. Set <code>DATA_DIR</code> in the environment to enable /rename.");
+        return;
+      }
+      const active = ctx.store.getActiveSession(ctx.storeKey);
+      if (!active) {
+        await adapter.sendMessage(message.chatId, "No active session to rename. Send a message first, or tap ➕ New in /sessions.");
+        return;
+      }
+      const newTitle = command.title.length <= 60 ? command.title : `${command.title.slice(0, 60)}…`;
+      ctx.store.setTitle(ctx.storeKey, active.sessionId, newTitle);
+      await adapter.sendMessage(message.chatId, `Renamed to: <b>${escapeHtml(newTitle)}</b>`);
       return;
     }
 
